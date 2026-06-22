@@ -39,17 +39,20 @@ class CFG:
     try:
         DHAN_CLIENT_ID    = st.secrets.get("DHAN_CLIENT_ID",    os.getenv("DHAN_CLIENT_ID",    ""))
         DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", os.getenv("DHAN_ACCESS_TOKEN", ""))
+        OWNER_PASSWORD    = st.secrets.get("OWNER_PASSWORD",    os.getenv("OWNER_PASSWORD",    "12345"))
     except Exception:
         DHAN_CLIENT_ID    = os.getenv("DHAN_CLIENT_ID",    "")
         DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
+        OWNER_PASSWORD    = os.getenv("OWNER_PASSWORD",    "12345")
     USE_DHAN      = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
     USE_DEMO_MODE = not USE_DHAN
 
 # ─────────────────────────────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────────────
-RISK_FREE_RATE = 0.065
-ATM_BAND       = 10
+RISK_FREE_RATE        = 0.065
+ATM_BAND              = 10
+AUTO_REFRESH_SECONDS  = 60
 
 DHAN_SECURITY = {
     "GOLD":    {"id": 114, "seg": "MCX_COMM", "step": 100},
@@ -1039,9 +1042,66 @@ if "oi_history" not in st.session_state:
     st.session_state["oi_history"] = {}
 if "last_refresh" not in st.session_state:
     st.session_state["last_refresh"] = 0
+if "is_owner" not in st.session_state:
+    st.session_state["is_owner"] = False
+if "owner_pw_attempt" not in st.session_state:
+    st.session_state["owner_pw_attempt"] = ""
+if "owner_login_error" not in st.session_state:
+    st.session_state["owner_login_error"] = False
+
+# ── SIDEBAR: Owner Login ──────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(f"""
+    <div style="text-align:center; padding: 8px 0 12px 0;">
+        <span style="font-size:20px;">🌟</span>
+        <div style="font-size:13px; font-weight:700; color:{GOLD}; margin-top:4px;">
+            Commodities Dashboard
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.divider()
+
+    if st.session_state["is_owner"]:
+        st.markdown(f"""
+        <div style="background:#1a2e00; border:1.5px solid #00E676; border-radius:8px;
+                    padding:10px 14px; text-align:center; margin-bottom:12px;">
+            <div style="font-size:14px; font-weight:800; color:#00E676;">🔑 OWNER MODE</div>
+            <div style="font-size:10px; color:#888; margin-top:2px;">Full controls unlocked</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("🔒 Log out", use_container_width=True):
+            st.session_state["is_owner"] = False
+            st.session_state["owner_login_error"] = False
+            st.rerun()
+    else:
+        st.markdown(f"""
+        <div style="background:#1a1a2e; border:1px solid {BORDER}; border-radius:8px;
+                    padding:10px 14px; text-align:center; margin-bottom:12px;">
+            <div style="font-size:12px; font-weight:700; color:{MUTED};">👁 VIEW-ONLY MODE</div>
+            <div style="font-size:10px; color:#555; margin-top:2px;">Enter password to unlock owner controls</div>
+        </div>
+        """, unsafe_allow_html=True)
+        pw_input = st.text_input("Owner Password", type="password", key="pw_field",
+                                 placeholder="Enter owner password…")
+        if st.button("🔑 Unlock Owner Mode", use_container_width=True):
+            if pw_input == CFG.OWNER_PASSWORD:
+                st.session_state["is_owner"] = True
+                st.session_state["owner_login_error"] = False
+                st.rerun()
+            else:
+                st.session_state["owner_login_error"] = True
+        if st.session_state["owner_login_error"]:
+            st.error("Incorrect password.")
+
+    st.divider()
+    st.markdown(f"""
+    <div style="font-size:10px; color:{MUTED}; text-align:center; line-height:1.6;">
+        Data source: {'Dhan API ✅' if CFG.USE_DHAN else 'DEMO MODE'}<br>
+        Auto-refresh: {AUTO_REFRESH_SECONDS}s
+    </div>
+    """, unsafe_allow_html=True)
 
 # ── Auto-refresh (60 seconds) ─────────────────────────────────────────
-AUTO_REFRESH_SECONDS = 60
 time_since = time.time() - st.session_state["last_refresh"]
 
 # Use a placeholder for auto-refresh countdown
@@ -1060,6 +1120,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── TOP CONTROLS ──────────────────────────────────────────────────────
+is_owner = st.session_state["is_owner"]
+
 col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5 = st.columns([1.5, 1.5, 2, 1.5, 1])
 
 with col_ctrl1:
@@ -1071,8 +1133,22 @@ with col_ctrl2:
         expiries = fetch_dhan_expiry_list(symbol)
     else:
         expiries = [(date.today() + timedelta(days=10)).strftime("%Y-%m-%d")]
-    expiry = st.selectbox("EXPIRY", expiries, index=0 if expiries else None,
-                          help="Select expiry date" if expiries else "No expiries available")
+
+    if is_owner:
+        expiry = st.selectbox("EXPIRY", expiries, index=0 if expiries else None,
+                              help="Select expiry date" if expiries else "No expiries available")
+        # Persist owner's expiry choice
+        st.session_state["selected_expiry"] = expiry
+    else:
+        # Viewer: show whichever expiry the owner last selected (or nearest)
+        expiry = st.session_state.get("selected_expiry", expiries[0] if expiries else "")
+        st.markdown(f"""
+        <div style="padding-top: 6px;">
+            <div style="font-size: 10px; color: {MUTED}; text-transform: uppercase;
+                        letter-spacing: 0.5px; margin-bottom: 4px;">EXPIRY</div>
+            <div style="font-size: 14px; font-weight: 700; color: #80CBC4;">{expiry}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 with col_ctrl3:
     st.markdown(f"""
@@ -1089,19 +1165,32 @@ with col_ctrl4:
     """, unsafe_allow_html=True)
 
 with col_ctrl5:
-    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-    refresh_clicked = st.button("⟳ Refresh", use_container_width=True)
+    if is_owner:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        refresh_clicked = st.button("⟳ Refresh", use_container_width=True)
+    else:
+        refresh_clicked = False
+        st.markdown(f"""
+        <div style="padding-top: 32px; font-size: 10px; color: {MUTED}; text-align:center;">
+            🔒 View Only
+        </div>
+        """, unsafe_allow_html=True)
 
 # ── Auto-refresh logic ────────────────────────────────────────────────
-auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
+if is_owner:
+    auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
+else:
+    auto_refresh = True  # always auto-refresh for viewers, silently
+
 if auto_refresh:
-    # Display countdown
-    remaining = max(0, AUTO_REFRESH_SECONDS - int(time_since))
-    refresh_placeholder.markdown(
-        f"<div style='text-align:center; font-size:11px; color:{MUTED};'>"
-        f"⏳ Auto-refresh in {remaining}s</div>",
-        unsafe_allow_html=True
-    )
+    if is_owner:
+        # Show countdown only to owner
+        remaining = max(0, AUTO_REFRESH_SECONDS - int(time_since))
+        refresh_placeholder.markdown(
+            f"<div style='text-align:center; font-size:11px; color:{MUTED};'>"
+            f"⏳ Auto-refresh in {remaining}s</div>",
+            unsafe_allow_html=True
+        )
     if time_since >= AUTO_REFRESH_SECONDS:
         st.session_state["last_refresh"] = time.time()
         st.rerun()
