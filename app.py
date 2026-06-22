@@ -11,7 +11,16 @@
 """
 
 import os, json, time, warnings, csv as _csv, io, requests
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
+
+# ── IST helpers ───────────────────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist() -> datetime:
+    return datetime.now(_IST)
+
+def strftime_ist(fmt: str) -> str:
+    return now_ist().strftime(fmt)
 
 import pandas as pd
 import numpy as np
@@ -953,7 +962,7 @@ def _build_oi_vel_chart(sym_history, side="CALL"):
 # ─────────────────────────────────────────────────────────────────────
 def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
     if not roll: return oi_history
-    ts    = time.strftime("%H:%M")
+    ts    = strftime_ist("%H:%M")
     entry = {"ts": ts, "near_oi": roll.get("near_oi", 0), "next_oi": roll.get("next_oi", 0),
              "total_oi": roll.get("near_oi", 0) + roll.get("next_oi", 0)}
     hist  = oi_history.setdefault(symbol, [])
@@ -1210,7 +1219,7 @@ with col_ctrl3:
 with col_ctrl4:
     st.markdown(f"""
     <div style="padding-top: 28px; font-size: 11px; color: {MUTED};">
-        🕐 Last updated: {time.strftime('%H:%M:%S')}
+        🕐 Last updated: {strftime_ist('%H:%M:%S')} IST
     </div>
     """, unsafe_allow_html=True)
 
@@ -1272,7 +1281,7 @@ roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
 st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
 
 # Build and save history tick
-ts_full = datetime.now().isoformat(timespec="seconds")
+ts_full = now_ist().isoformat(timespec="seconds")
 tick = {
     "ts":            ts_full,
     "symbol":        symbol,
