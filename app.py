@@ -51,7 +51,7 @@ class CFG:
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────────────
 RISK_FREE_RATE        = 0.065
-ATM_BAND              = 10
+ATM_BAND              = 20   # ±20 strikes from ATM (41 total)
 AUTO_REFRESH_SECONDS  = 60
 
 DHAN_SECURITY = {
@@ -116,21 +116,21 @@ def get_dynamic_futures_ids():
 # ─────────────────────────────────────────────────────────────────────
 #  COLORS
 # ─────────────────────────────────────────────────────────────────────
-BG         = "#0D0D1A"
-CARD       = "#1A1A2E"
-TEXT       = "#E0E0E0"
-ACCENT     = "#D4AF37"
-MUTED      = "#666680"
-GOLD       = "#FFD700"
-SILVER     = "#C0C0C0"
-GREEN      = "#00E676"
-RED        = "#FF5252"
-AMBER      = "#FFD600"
-BLUE       = "#64B5F6"
-CYAN       = "#00E5FF"
-PINK       = "#FF4081"
-BORDER     = "#2a2a3e"
-SECTION_BG = "#1f1f38"
+BG         = "#FFFFFF"
+CARD       = "#F8FAFC"
+TEXT       = "#1E293B"
+ACCENT     = "#B8960C"
+MUTED      = "#64748B"
+GOLD       = "#B8960C"
+SILVER     = "#475569"
+GREEN      = "#059669"
+RED        = "#DC2626"
+AMBER      = "#D97706"
+BLUE       = "#2563EB"
+CYAN       = "#0891B2"
+PINK       = "#DB2777"
+BORDER     = "#E2E8F0"
+SECTION_BG = "#F1F5F9"
 
 METRIC_EXPLAIN = {
     "EV Ratio":     "Call vs put time-value; >1.2 = bulls paying more (bullish), <0.8 = bears paying more (bearish).",
@@ -409,7 +409,7 @@ def fetch_demo_option_chain(symbol: str = "GOLD"):
         spot = 96500.0 + np.random.normal(0, 300)
         step = DHAN_SECURITY[symbol]["step"]
     atm     = round(spot / step) * step
-    strikes = np.arange(atm - 15 * step, atm + 16 * step, step)
+    strikes = np.arange(atm - 25 * step, atm + 26 * step, step)
     T       = 10 / 365.0
     r       = RISK_FREE_RATE
     vix     = 18.5 + np.random.normal(0, 1)
@@ -482,6 +482,39 @@ def compute_max_pain(df):
         results[K] = cl + pl
     return min(results, key=results.get) if results else 0.0
 
+def _fill_missing_greeks(df_band, spot, expiry=None):
+    """
+    If the API returned zero gammas (common with MCX commodity options),
+    compute them from Black-Scholes using the IV data we already have.
+    """
+    if df_band.empty:
+        return df_band
+    # Only fill if gammas are essentially missing
+    if df_band["call_gamma"].abs().max() > 1e-9 and df_band["put_gamma"].abs().max() > 1e-9:
+        return df_band
+    try:
+        if expiry:
+            exp_date = datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+            T = max((exp_date - date.today()).days, 1) / 365.0
+        else:
+            T = 10 / 365.0
+    except Exception:
+        T = 10 / 365.0
+    r   = RISK_FREE_RATE
+    df2 = df_band.copy()
+    for idx, row in df2.iterrows():
+        K    = float(row["strike"])
+        iv_c = float(row.get("call_iv", 0) or 0) / 100.0
+        iv_p = float(row.get("put_iv",  0) or 0) / 100.0
+        iv_c = iv_c if iv_c > 0.01 else 0.15
+        iv_p = iv_p if iv_p > 0.01 else 0.15
+        _, cg, _, _ = _bs_greeks(spot, K, T, r, iv_c, "CE")
+        _, pg, _, _ = _bs_greeks(spot, K, T, r, iv_p, "PE")
+        df2.at[idx, "call_gamma"] = cg
+        df2.at[idx, "put_gamma"]  = pg
+    return df2
+
+
 def compute_gamma_flip(df_band, spot):
     if df_band.empty:
         return None
@@ -513,10 +546,11 @@ def compute_iv_rank(df_band):
         return 50.0
     return round((atm_iv - iv_min) / (iv_max - iv_min) * 100, 1)
 
-def compute_metrics(df, spot, symbol="GOLD"):
+def compute_metrics(df, spot, symbol="GOLD", expiry=None):
     if df.empty:
         return {}
     df_band, atm = select_atm_band(df, spot, symbol)
+    df_band = _fill_missing_greeks(df_band, spot, expiry)
     step         = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
 
     df_band["intr_c"] = np.maximum(0, spot - df_band["strike"])
@@ -745,11 +779,11 @@ def _oi_regime_info(c_bkt, p_bkt):
     buyer  = (avg_c > 1.0 * c_std) or (avg_p > 1.0 * p_std)
     seller = (avg_c <= 0.8 * c_std) and (avg_p <= 0.8 * p_std)
     if buyer and not seller:
-        return {"label": "OPTION BUYER'S REGIME", "sub": "OI velocity elevated — directional participants active. Premium is expensive. Favour directional plays.", "bg": "#1a1a00", "fg": "#FFD600", "border": "#FFD600"}
+        return {"label": "OPTION BUYER'S REGIME", "sub": "OI velocity elevated — directional participants active. Premium is expensive. Favour directional plays.", "bg": "#FFFBEB", "fg": "#D97706", "border": "#D97706"}
     elif seller:
-        return {"label": "OPTION SELLER'S REGIME", "sub": "OI velocity subdued — writers in control. Range-bound / premium decay favoured. Sell spreads or iron condors.", "bg": "#001a0d", "fg": "#00E676", "border": "#00E676"}
+        return {"label": "OPTION SELLER'S REGIME", "sub": "OI velocity subdued — writers in control. Range-bound / premium decay favoured. Sell spreads or iron condors.", "bg": "#F0FDF4", "fg": "#059669", "border": "#059669"}
     else:
-        return {"label": "TRANSITIONAL REGIME", "sub": "Mixed OI signals — neither buyers nor sellers clearly dominant. Wait for clarity.", "bg": "#001a2e", "fg": "#80CBC4", "border": "#80CBC4"}
+        return {"label": "TRANSITIONAL REGIME", "sub": "Mixed OI signals — neither buyers nor sellers clearly dominant. Wait for clarity.", "bg": "#EFF6FF", "fg": "#0891B2", "border": "#0891B2"}
 
 def _combined_bias_info(c_bkt, p_bkt):
     if not c_bkt or not p_bkt:
@@ -780,7 +814,10 @@ def _combined_bias_info(c_bkt, p_bkt):
 #  CHARTS
 # ─────────────────────────────────────────────────────────────────────
 def chart_layout(**kw):
-    return dict(paper_bgcolor=CARD, plot_bgcolor=CARD, font=dict(color=TEXT, size=11),
+    return dict(paper_bgcolor="#FFFFFF", plot_bgcolor="#F8FAFC",
+                font=dict(color=TEXT, size=11),
+                xaxis=dict(gridcolor="#E2E8F0", linecolor="#CBD5E1"),
+                yaxis=dict(gridcolor="#E2E8F0", linecolor="#CBD5E1"),
                 margin=dict(l=40, r=20, t=55, b=38), height=340, **kw)
 
 def score_gauge_fig(score):
@@ -790,12 +827,12 @@ def score_gauge_fig(score):
         title={"text": "Market Score", "font": {"color": TEXT, "size": 12}},
         number={"font": {"color": color, "size": 36}},
         gauge={"axis": {"range": [0, 100], "tickcolor": "#444"}, "bar": {"color": color}, "bgcolor": CARD,
-               "steps": [{"range": [0,30], "color": "#1a0000"}, {"range": [30,45], "color": "#1a0f00"},
-                         {"range": [45,55], "color": "#141400"}, {"range": [55,70], "color": "#001a00"},
-                         {"range": [70,100], "color": "#002600"}],
+               "steps": [{"range": [0,30], "color": "#FEE2E2"}, {"range": [30,45], "color": "#FFEDD5"},
+                         {"range": [45,55], "color": "#FEF3C7"}, {"range": [55,70], "color": "#DCFCE7"},
+                         {"range": [70,100], "color": "#D1FAE5"}],
                "threshold": {"line": {"color": color, "width": 3}, "thickness": 0.8, "value": score}},
     ))
-    fig.update_layout(paper_bgcolor="#111", plot_bgcolor="#111", margin=dict(l=20, r=20, t=30, b=5), height=220)
+    fig.update_layout(paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF", margin=dict(l=20, r=20, t=30, b=5), height=220)
     return fig
 
 def build_iv_history_chart(sym_history):
@@ -825,13 +862,13 @@ def build_iv_history_chart(sym_history):
     direction = ("IV RISING" if iv_delta > 0.5 else ("IV FALLING" if iv_delta < -0.5 else "IV FLAT"))
     line_color = ("#059669" if iv_delta < -0.5 else ("#DC2626" if iv_delta > 0.5 else CYAN))
     fig = go.Figure()
-    fig.add_hline(y=0, line_dash="dash", line_color="#555", opacity=0.5, annotation_text="open baseline", annotation_font_size=10)
+    fig.add_hline(y=0, line_dash="dash", line_color="#94A3B8", opacity=0.7, annotation_text="open baseline", annotation_font_size=10)
     fig.add_trace(go.Scatter(x=labels, y=cum_d, mode="lines+markers", name="Cumul Δ ATM IV",
                              line=dict(color=line_color, width=2.5), marker=dict(size=6, color=line_color),
                              hovertemplate="<b>%{x}</b><br>Cumul Δ IV: %{y:+.2f}pp<extra></extra>"))
     lk = chart_layout(title=f"Cumul Δ ATM IV — 15-min | {direction}  ({iv_delta:+.2f}pp)")
-    lk["yaxis"] = dict(title="Δ IV (pp)", gridcolor="#222")
-    lk["xaxis"] = dict(title="15-min bucket", gridcolor="#222")
+    lk["yaxis"] = dict(title="Δ IV (pp)", gridcolor="#E2E8F0")
+    lk["xaxis"] = dict(title="15-min bucket", gridcolor="#E2E8F0")
     fig.update_layout(**lk)
     return fig
 
@@ -901,13 +938,13 @@ def _build_oi_vel_chart(sym_history, side="CALL"):
         fig.add_trace(go.Scatter(x=live_x, y=live_y, mode="markers", name="🔴 Live (forming)",
                                  marker=dict(size=10, color=line_color, opacity=0.5, symbol="circle-open",
                                              line=dict(width=2, color=line_color))))
-    for y_val, dash, col, ann in [(0, "dash", "#555", "mean"), (2, "dot", RED, "+2σ"),
+    for y_val, dash, col, ann in [(0, "dash", "#94A3B8", "mean"), (2, "dot", RED, "+2σ"),
                                    (1, "dot", AMBER, "+1σ"), (-1, "dot", GREEN, "−1σ"), (-2, "dot", GREEN, "−2σ")]:
         fig.add_hline(y=y_val, line_dash=dash, line_color=col, opacity=0.5,
                       annotation_text=ann, annotation_font_size=10)
     lk = chart_layout(title=f"Δ {side_label} OI Vel Z-Score — 15-min | {alert}")
-    lk["yaxis"] = dict(title="Z-score (σ)", gridcolor="#222")
-    lk["xaxis"] = dict(title="15-min bucket", gridcolor="#222")
+    lk["yaxis"] = dict(title="Z-score (σ)", gridcolor="#E2E8F0")
+    lk["xaxis"] = dict(title="15-min bucket", gridcolor="#E2E8F0")
     fig.update_layout(**lk)
     return fig
 
@@ -1022,15 +1059,28 @@ st.markdown(f"""
     }}
     .stButton button {{
         background-color: {ACCENT};
-        color: black;
+        color: #FFFFFF;
         font-weight: bold;
         border: none;
         border-radius: 6px;
     }}
-    
+
     /* Divider */
     hr {{
         border-color: {BORDER};
+    }}
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {{
+        background-color: #F8FAFC;
+        border-right: 1px solid {BORDER};
+    }}
+
+    /* Input fields */
+    .stTextInput input {{
+        background-color: #FFFFFF;
+        border: 1px solid {BORDER};
+        color: {TEXT};
     }}
 </style>
 """, unsafe_allow_html=True)
@@ -1212,7 +1262,7 @@ if df.empty:
     st.error("No data available. Check API credentials or try again.")
     st.stop()
 
-m = compute_metrics(df, spot, symbol)
+m = compute_metrics(df, spot, symbol, expiry=exp)
 score = compute_score(m)
 strat = strategy_recommendation(score, m, symbol)
 df_band = m.pop("df_band", df)
