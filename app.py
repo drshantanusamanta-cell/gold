@@ -1569,6 +1569,18 @@ if roll:
         st.plotly_chart(f_oi, use_container_width=True, config={"displayModeBar": False})
 else:
     st.warning("Roll data unavailable")
+    with st.expander("🔍 Debug: Futures Contract ID Lookup", expanded=True):
+        st.caption("Fetching dynamic futures IDs from Dhan master CSV…")
+        debug_ids = get_dynamic_futures_ids()
+        if debug_ids:
+            st.success(f"Master CSV loaded. IDs found: {debug_ids}")
+            ids_for_sym = debug_ids.get(symbol, [])
+            if len(ids_for_sym) < 2:
+                st.error(f"Only {len(ids_for_sym)} contract(s) found for {symbol} — need at least 2 (near + next month).")
+            else:
+                st.info(f"{symbol} has {len(ids_for_sym)} contracts. Roll fetch must have failed at the marketquote API step.")
+        else:
+            st.error("get_dynamic_futures_ids() returned empty — master CSV download failed or no matching contracts found.")
 
 # ── SECTION 8: INTELLIGENCE DASHBOARD ─────────────────────────────────
 st.markdown("---")
