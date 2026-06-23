@@ -365,46 +365,72 @@ def fetch_dhan_option_chain(symbol: str = "GOLD", expiry: str = None):
     return df, spot, expiry
 
 def fetch_futures_roll(symbol: str = "GOLD") -> dict:
+    """
+    Fetch near and next month futures roll data using the Dhan option chain API.
+    Uses the two nearest expiries — no CSV download required.
+    """
     if not CFG.USE_DHAN:
         return {}
-    
-    # Fetch the dynamic IDs automatically
-    futcom_ids = get_dynamic_futures_ids()
-    ids = futcom_ids.get(symbol, [])
-    
-    if len(ids) < 2:
-        print(f"[Dhan] Could not find 2 valid futures contracts for {symbol}")
-        return {}
-        
-    near_id, next_id = ids[0], ids[1]
-    
+
+    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])
     headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
+
+    # Step 1: get expiry list (already proven to work)
     try:
-        resp     = requests.post("https://api.dhan.co/v2/marketquote", headers=headers,
-                                 json={"securities": {"MCX_COMM": [str(near_id), str(next_id)]}}, timeout=10)
-        d        = resp.json().get("data", {})
-        near     = d.get(str(near_id), {})
-        nxt      = d.get(str(next_id), {})
-        near_ltp = float(near.get("last_price",    0) or 0)
-        next_ltp = float(nxt.get("last_price",     0) or 0)
-        near_oi  = int(near.get("open_interest",   0) or 0)
-        next_oi  = int(nxt.get("open_interest",    0) or 0)
-        near_vol = int(near.get("volume",           0) or 0)
-        next_vol = int(nxt.get("volume",            0) or 0)
-        total_oi        = near_oi + next_oi
-        roll_spread     = round(next_ltp - near_ltp, 2)
-        roll_spread_pct = round((roll_spread / near_ltp * 100) if near_ltp else 0, 3)
-        rollover_pct    = round((next_oi / total_oi * 100) if total_oi else 0, 1)
-        if roll_spread > 0:   bias, bias_color = "CONTANGO ▲  Bullish Carry", "#00E676"
-        elif roll_spread < 0: bias, bias_color = "BACKWARDATION ▼  Delivery Pressure", "#FF5252"
-        else:                 bias, bias_color = "FLAT", "#FFD600"
-        return {"near_ltp": near_ltp, "next_ltp": next_ltp, "near_oi": near_oi, "next_oi": next_oi,
-                "near_vol": near_vol, "next_vol": next_vol, "roll_spread": roll_spread,
-                "roll_spread_pct": roll_spread_pct, "rollover_pct": rollover_pct,
-                "bias": bias, "bias_color": bias_color}
+        exp_resp = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
+                                 json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]}, timeout=15)
+        expiries = exp_resp.json().get("data", [])
+        today    = date.today().isoformat()
+        future   = [e for e in expiries if e >= today]
+        if len(future) < 2:
+            print(f"[Roll] Fewer than 2 future expiries for {symbol}: {future}")
+            return {}
+        near_expiry, next_expiry = future[0], future[1]
     except Exception as e:
-        print(f"[Dhan] Roll error: {e}")
+        print(f"[Roll] Expiry list error: {e}")
         return {}
+
+    # Step 2: fetch option chain for each expiry to get underlying last price + OI
+    def _fetch_chain(expiry):
+        try:
+            r    = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
+                                 json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry}, timeout=20)
+            data = r.json().get("data", {})
+            ltp  = float(data.get("last_price", 0) or 0)
+            oc   = data.get("oc", {})
+            call_oi = sum(int((v.get("ce") or {}).get("oi", 0) or 0) for v in oc.values())
+            put_oi  = sum(int((v.get("pe") or {}).get("oi", 0) or 0) for v in oc.values())
+            call_vol = sum(int((v.get("ce") or {}).get("volume", 0) or 0) for v in oc.values())
+            put_vol  = sum(int((v.get("pe") or {}).get("volume", 0) or 0) for v in oc.values())
+            return ltp, call_oi + put_oi, call_vol + put_vol
+        except Exception as e:
+            print(f"[Roll] Chain fetch error for {expiry}: {e}")
+            return 0.0, 0, 0
+
+    near_ltp, near_oi, near_vol = _fetch_chain(near_expiry)
+    next_ltp, next_oi, next_vol = _fetch_chain(next_expiry)
+
+    if near_ltp == 0:
+        print(f"[Roll] near_ltp is 0 for {symbol} — market may be closed or data unavailable")
+        return {}
+
+    total_oi        = near_oi + next_oi
+    roll_spread     = round(next_ltp - near_ltp, 2)
+    roll_spread_pct = round((roll_spread / near_ltp * 100) if near_ltp else 0, 3)
+    rollover_pct    = round((next_oi / total_oi * 100) if total_oi else 0, 1)
+
+    if roll_spread > 0:   bias, bias_color = "CONTANGO ▲  Bullish Carry",          "#00E676"
+    elif roll_spread < 0: bias, bias_color = "BACKWARDATION ▼  Delivery Pressure", "#FF5252"
+    else:                 bias, bias_color = "FLAT",                                "#FFD600"
+
+    return {
+        "near_ltp": near_ltp, "next_ltp": next_ltp,
+        "near_oi":  near_oi,  "next_oi":  next_oi,
+        "near_vol": near_vol, "next_vol": next_vol,
+        "roll_spread": roll_spread, "roll_spread_pct": roll_spread_pct,
+        "rollover_pct": rollover_pct, "bias": bias, "bias_color": bias_color,
+        "near_expiry": near_expiry, "next_expiry": next_expiry,
+    }
 
 # ─────────────────────────────────────────────────────────────────────
 #  DEMO MODE
@@ -1568,19 +1594,7 @@ if roll:
             f_oi.update_layout(**chart_layout(title="Intraday OI Curve (Building…)"))
         st.plotly_chart(f_oi, use_container_width=True, config={"displayModeBar": False})
 else:
-    st.warning("Roll data unavailable")
-    with st.expander("🔍 Debug: Futures Contract ID Lookup", expanded=True):
-        st.caption("Fetching dynamic futures IDs from Dhan master CSV…")
-        debug_ids = get_dynamic_futures_ids()
-        if debug_ids:
-            st.success(f"Master CSV loaded. IDs found: {debug_ids}")
-            ids_for_sym = debug_ids.get(symbol, [])
-            if len(ids_for_sym) < 2:
-                st.error(f"Only {len(ids_for_sym)} contract(s) found for {symbol} — need at least 2 (near + next month).")
-            else:
-                st.info(f"{symbol} has {len(ids_for_sym)} contracts. Roll fetch must have failed at the marketquote API step.")
-        else:
-            st.error("get_dynamic_futures_ids() returned empty — master CSV download failed or no matching contracts found.")
+    st.warning("Roll data unavailable — market may be closed or outside MCX trading hours (9 AM – 11:30 PM IST).")
 
 # ── SECTION 8: INTELLIGENCE DASHBOARD ─────────────────────────────────
 st.markdown("---")
