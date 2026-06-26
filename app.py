@@ -78,6 +78,54 @@ def get_dynamic_futures_ids():
     except Exception as e:
         print(f"[Auto-Scrips] Failed: {e}"); return {}
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_futures_contracts():
+    """
+    Returns {symbol: [{"id", "expiry", "tsym"}, ...]} for near/next/far FUTCOM contracts.
+    Expiry dates are parsed from the master CSV — no option-chain API call needed.
+    """
+    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    try:
+        resp = requests.get(url, timeout=15); resp.raise_for_status()
+        df   = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.upper() for c in df.columns]
+        df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX_COMM') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
+        today   = date.today().isoformat()
+        result  = {}
+
+        def _parse_exp(raw):
+            raw = str(raw or '').strip()
+            try:
+                if len(raw) == 10 and raw[4] == '-':   return raw              # YYYY-MM-DD
+                if len(raw) == 8  and raw.isdigit():   return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+                return datetime.strptime(raw, "%d-%b-%Y").strftime("%Y-%m-%d")
+            except Exception: return raw
+
+        for sym in COMMODITY_SYMBOLS:
+            if sym == "GOLDM":
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLDM')]
+            elif sym == "SILVERM":
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVERM')]
+            else:
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.startswith(sym)]
+            exp_col = 'SEM_EXPIRY_DATE' if 'SEM_EXPIRY_DATE' in df_sym.columns else 'SEM_EXPIRY_CODE'
+            df_sym  = df_sym.dropna(subset=[exp_col]).copy()
+            df_sym['_exp'] = df_sym[exp_col].apply(_parse_exp)
+            df_sym  = df_sym[df_sym['_exp'] >= today].sort_values('_exp')
+            contracts = []
+            for _, row in df_sym.iterrows():
+                contracts.append({
+                    "id":    int(row['SEM_SMST_SECURITY_ID']),
+                    "expiry": row['_exp'],
+                    "tsym":  str(row.get('SEM_TRADING_SYMBOL', '') or ''),
+                })
+                if len(contracts) >= 3: break
+            result[sym] = contracts
+        print(f"[FutContracts] {result}")
+        return result
+    except Exception as e:
+        print(f"[FutContracts] Failed: {e}"); return {}
+
 BG         = "#FFFFFF"; CARD       = "#F8FAFC"; TEXT       = "#1E293B"
 ACCENT     = "#B8960C"; MUTED      = "#64748B"; GOLD       = "#B8960C"
 SILVER     = "#475569"; GREEN      = "#059669"; RED        = "#DC2626"
@@ -216,8 +264,8 @@ def _solve_iv(mkt, S, K, T, r, opt):
 # ─────────────────────────────────────────────────────────────────────
 #  DHAN FETCHERS
 #  Cache option chain calls for 55s (just under the 60s refresh cycle).
-#  This ensures the roll's _fetch_oi calls for near-expiry hit the cache
-#  rather than making a live API call, keeping total Dhan API calls ≤ 3.
+#  fetch_futures_roll() uses /v2/marketfeed/quote (not option chain), so
+#  total Dhan API calls per refresh: expiry list + option chain + quote = 3.
 # ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_dhan_expiry_list(symbol="GOLDM"):
@@ -286,37 +334,56 @@ def fetch_dhan_option_chain(symbol="GOLDM", expiry=None):
     return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True), spot, expiry
 
 # ─────────────────────────────────────────────────────────────────────
-#  FUTURES ROLL — 3-MONTH with LTP ENDPOINT FIX
-#  Root cause of original bug: option-chain last_price returns the same
-#  underlying near-month price regardless of which expiry you query.
-#  Fix: use /v2/marketfeed/ltp with per-contract security IDs.
+#  FUTURES ROLL — 3-MONTH
+#  Uses /v2/marketfeed/quote (ONE call) for LTP + futures OI + volume.
+#  Falls back to /v2/marketfeed/ltp if quote gives no prices.
+#  Expiry dates come from master CSV via get_futures_contracts() — no
+#  option-chain expiry-list or _fetch_oi calls, so zero extra API hits.
 # ─────────────────────────────────────────────────────────────────────
 def fetch_futures_roll(symbol="GOLDM") -> dict:
     if not CFG.USE_DHAN: return {}
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
-    headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
 
-    # Step 1: expiry list
-    try:
-        er      = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
-                                json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]}, timeout=15)
-        expiries = er.json().get("data", [])
-        today    = date.today().isoformat()
-        future   = [e for e in expiries if e >= today]
-        if len(future) < 2: print(f"[Roll] < 2 expiries for {symbol}"); return {}
-        near_expiry = future[0]; next_expiry = future[1]
-        far_expiry  = future[2] if len(future) >= 3 else None
-    except Exception as e: print(f"[Roll] Expiry error: {e}"); return {}
+    contracts = get_futures_contracts().get(symbol, [])
+    if len(contracts) < 2:
+        print(f"[Roll] < 2 contracts in master CSV for {symbol}"); return {}
 
-    # Step 2: per-contract LTPs via LTP endpoint (not option-chain last_price)
-    fut_ids  = get_dynamic_futures_ids().get(symbol, [])
-    near_id  = fut_ids[0] if len(fut_ids) >= 1 else None
-    next_id  = fut_ids[1] if len(fut_ids) >= 2 else None
-    far_id   = fut_ids[2] if len(fut_ids) >= 3 else None
+    near_c = contracts[0]; next_c = contracts[1]
+    far_c  = contracts[2] if len(contracts) >= 3 else None
+
+    near_id     = near_c["id"];    next_id     = next_c["id"];    far_id     = far_c["id"]    if far_c else None
+    near_expiry = near_c["expiry"]; next_expiry = next_c["expiry"]; far_expiry = far_c["expiry"] if far_c else ""
+    near_tsym   = near_c["tsym"];  next_tsym   = next_c["tsym"];  far_tsym   = far_c["tsym"]  if far_c else ""
+
+    headers      = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
+    ids_to_fetch = [i for i in [near_id, next_id, far_id] if i is not None]
+
     near_ltp = next_ltp = far_ltp = 0.0
+    near_oi  = next_oi  = far_oi  = 0
+    near_vol = next_vol = far_vol = 0
 
-    if near_id:
-        ids_to_fetch = [i for i in [near_id, next_id, far_id] if i is not None]
+    # ── Try /v2/marketfeed/quote — gives LTP + OI + Volume in ONE call ──
+    try:
+        qr = requests.post("https://api.dhan.co/v2/marketfeed/quote", headers=headers,
+                           json={"MCX_COMM": ids_to_fetch}, timeout=12)
+        qd = qr.json().get("data", {}).get("MCX_COMM", {})
+
+        def _q(sid):
+            if sid is None: return 0.0, 0, 0
+            d   = qd.get(str(sid), {}) or {}
+            ltp = float(d.get("last_price", d.get("lastTradedPrice", d.get("ltp", 0))) or 0)
+            oi  = int(d.get("oi", d.get("open_interest", d.get("openInterest", d.get("netOI", 0)))) or 0)
+            vol = int(d.get("volume", d.get("totalVolume", d.get("total_volume", 0))) or 0)
+            return ltp, oi, vol
+
+        near_ltp, near_oi, near_vol = _q(near_id)
+        next_ltp, next_oi, next_vol = _q(next_id)
+        far_ltp,  far_oi,  far_vol  = _q(far_id)
+        print(f"[Roll/Quote/{symbol}] near={near_ltp},oi={near_oi} next={next_ltp},oi={next_oi} far={far_ltp},oi={far_oi}")
+    except Exception as e:
+        print(f"[Roll/{symbol}] Quote endpoint failed: {e}")
+
+    # ── Fallback: /v2/marketfeed/ltp (price only, no OI) ──
+    if near_ltp == 0:
         try:
             lr    = requests.post("https://api.dhan.co/v2/marketfeed/ltp", headers=headers,
                                   json={"MCX_COMM": ids_to_fetch}, timeout=10)
@@ -324,58 +391,32 @@ def fetch_futures_roll(symbol="GOLDM") -> dict:
             near_ltp = float((ld.get(str(near_id)) or {}).get("last_price", 0) or 0)
             next_ltp = float((ld.get(str(next_id)) or {}).get("last_price", 0) or 0) if next_id else 0.0
             far_ltp  = float((ld.get(str(far_id))  or {}).get("last_price", 0) or 0) if far_id  else 0.0
-            print(f"[Roll/{symbol}] near={near_ltp} next={next_ltp} far={far_ltp}")
-        except Exception as e: print(f"[Roll/{symbol}] LTP endpoint failed: {e}")
-
-    # Fallback: option-chain last_price for near only
-    if near_ltp == 0:
-        try:
-            r2 = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
-                               json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-                                     "Expiry": near_expiry}, timeout=20)
-            near_ltp = float(r2.json().get("data", {}).get("last_price", 0) or 0)
-            print(f"[Roll/{symbol}] Fallback OC LTP: near={near_ltp}")
-        except Exception as e: print(f"[Roll/{symbol}] Fallback failed: {e}")
+            print(f"[Roll/LTP/{symbol}] near={near_ltp} next={next_ltp} far={far_ltp}")
+        except Exception as e:
+            print(f"[Roll/{symbol}] LTP fallback failed: {e}")
 
     if near_ltp == 0:
         print(f"[Roll] near_ltp=0 for {symbol} — market closed or data unavailable"); return {}
-
-    # Step 3: OI per expiry via option chain (options OI as positioning proxy)
-    def _fetch_oi(exp):
-        try:
-            r  = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
-                               json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-                                     "Expiry": exp}, timeout=20)
-            oc = r.json().get("data", {}).get("oc", {})
-            oi  = sum(int((v.get("ce") or {}).get("oi",0) or 0) + int((v.get("pe") or {}).get("oi",0) or 0) for v in oc.values())
-            vol = sum(int((v.get("ce") or {}).get("volume",0) or 0) + int((v.get("pe") or {}).get("volume",0) or 0) for v in oc.values())
-            return oi, vol
-        except Exception: return 0, 0
-
-    near_oi, near_vol = _fetch_oi(near_expiry)
-    next_oi, next_vol = _fetch_oi(next_expiry)
-    far_oi,  far_vol  = _fetch_oi(far_expiry) if far_expiry else (0, 0)
 
     total_oi        = near_oi + next_oi
     roll_spread     = round(next_ltp - near_ltp, 2)
     roll_spread_pct = round((roll_spread / near_ltp * 100) if near_ltp else 0, 3)
     rollover_pct    = round((next_oi / total_oi * 100) if total_oi else 0, 1)
 
-    # Annualised slopes
+    # Annualised term-structure slopes
+    slope_near_next = slope_next_far = 0.0
     try:
-        nd  = datetime.strptime(near_expiry, "%Y-%m-%d").date()
-        xtd = datetime.strptime(next_expiry, "%Y-%m-%d").date()
+        nd      = datetime.strptime(near_expiry, "%Y-%m-%d").date()
+        xtd     = datetime.strptime(next_expiry, "%Y-%m-%d").date()
         days_nn = max((xtd - nd).days, 1)
         slope_near_next = round((next_ltp - near_ltp) / near_ltp * (365/days_nn) * 100, 2) if near_ltp > 0 else 0.0
-    except Exception: slope_near_next = roll_spread_pct
-
-    slope_next_far = 0.0
-    if far_expiry and far_ltp > 0 and next_ltp > 0:
-        try:
+        if far_expiry and far_ltp > 0 and next_ltp > 0:
             fd      = datetime.strptime(far_expiry, "%Y-%m-%d").date()
             days_nf = max((fd - xtd).days, 1)
             slope_next_far = round((far_ltp - next_ltp) / next_ltp * (365/days_nf) * 100, 2)
-        except Exception: pass
+    except Exception as e:
+        print(f"[Roll/{symbol}] Slope calc error: {e}")
+        slope_near_next = roll_spread_pct
 
     # Term structure shape
     if slope_near_next > 0 and slope_next_far > 0:
@@ -416,7 +457,8 @@ def fetch_futures_roll(symbol="GOLDM") -> dict:
         "rollover_pct": rollover_pct, "bias": bias, "bias_color": bias_color,
         "slope_near_next": slope_near_next, "slope_next_far": slope_next_far,
         "ts_shape": ts_shape, "ts_bias": ts_bias, "ts_color": ts_color, "ts_desc": ts_desc,
-        "near_expiry": near_expiry, "next_expiry": next_expiry, "far_expiry": far_expiry or "",
+        "near_expiry": near_expiry, "next_expiry": next_expiry, "far_expiry": far_expiry,
+        "near_tsym":   near_tsym,   "next_tsym":   next_tsym,   "far_tsym":   far_tsym,
         "has_far": bool(far_expiry and far_ltp > 0),
     }
 # ─────────────────────────────────────────────────────────────────────
@@ -470,6 +512,10 @@ def demo_futures_roll(symbol="GOLDM") -> dict:
     near_expiry = date.today().strftime("%Y-%m-%d")
     next_expiry = (date.today() + timedelta(days=30)).strftime("%Y-%m-%d")
     far_expiry  = (date.today() + timedelta(days=60)).strftime("%Y-%m-%d")
+    # Demo trading symbols
+    from calendar import month_abbr
+    _mn = lambda d: month_abbr[datetime.strptime(d,"%Y-%m-%d").month].upper() + datetime.strptime(d,"%Y-%m-%d").strftime("%y")
+    near_tsym = f"{symbol}{_mn(near_expiry)}"; next_tsym = f"{symbol}{_mn(next_expiry)}"; far_tsym = f"{symbol}{_mn(far_expiry)}"
     slope_near_next = round(roll_spread/near_ltp*(365/30)*100, 2)
     slope_next_far  = round((far_ltp-next_ltp)/next_ltp*(365/30)*100, 2)
     if slope_near_next > 0 and slope_next_far > 0:
@@ -489,6 +535,7 @@ def demo_futures_roll(symbol="GOLDM") -> dict:
         "slope_near_next": slope_near_next, "slope_next_far": slope_next_far,
         "ts_shape": ts_shape, "ts_bias": ts_bias, "ts_color": ts_color, "ts_desc": ts_desc,
         "near_expiry": near_expiry, "next_expiry": next_expiry, "far_expiry": far_expiry,
+        "near_tsym": near_tsym, "next_tsym": next_tsym, "far_tsym": far_tsym,
         "has_far": True,
     }
 
@@ -1408,54 +1455,131 @@ for col, (lbl, val, c, tip) in zip(level_cols, level_items):
 st.markdown("---")
 st.markdown("### 📦 Futures Roll Analysis & Intraday OI Curve")
 if roll:
-    roll_cols = st.columns(4)
-    roll_items = [
-        ("Near LTP",       f'₹ {roll["near_ltp"]:,.2f}',      GOLD),
-        ("Next LTP",       f'₹ {roll["next_ltp"]:,.2f}',      SILVER),
-        ("Roll Spread",    f'₹ {roll["roll_spread"]:+,.2f}',   roll["bias_color"]),
-        ("Spread %",       f'{roll["roll_spread_pct"]:+.3f} %',roll["bias_color"]),
-        ("Near Month OI",  f'{roll["near_oi"]:,}',             "#80CBC4"),
-        ("Next Month OI",  f'{roll["next_oi"]:,}',             "#CE93D8"),
-        ("Rollover %",     f'{roll["rollover_pct"]} %',        BLUE),
-        ("Structure",      roll["bias"],                        roll["bias_color"]),
-    ]
-    for i, (label, value, color) in enumerate(roll_items):
-        with roll_cols[i % 4]:
-            st.markdown(f"""
-            <div style="background-color:{CARD};border-radius:8px;padding:8px 12px;
-                        border:1px solid {BORDER};min-height:60px;">
-                <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">{label}</div>
-                <div style="font-size:16px;font-weight:700;color:{color};">{value}</div>
-            </div>""", unsafe_allow_html=True)
+    # ── Contract cards: Near / Next / Far ─────────────────────────────
+    _has_far = roll.get("has_far") and roll.get("far_ltp", 0) > 0
+    _ncols   = 3 if _has_far else 2
+    _contract_cols = st.columns(_ncols)
 
+    def _contract_card(col, label, color, ltp, oi, vol, vol_oi, expiry, tsym):
+        oi_str   = f"{oi:,}"  if oi  > 0 else "—"
+        vol_str  = f"{vol:,}" if vol > 0 else "—"
+        voi_str  = f"{vol_oi:.3f}" if vol_oi > 0 else "—"
+        # Shorten trading symbol for display
+        disp_sym = tsym[-7:] if len(tsym) > 7 else tsym
+        col.markdown(f"""
+        <div style="background:{CARD};border-radius:10px;padding:12px 16px;
+                    border:1px solid {BORDER};border-top:3px solid {color};">
+            <div style="font-size:10px;color:{MUTED};text-transform:uppercase;letter-spacing:0.5px;">{label}</div>
+            <div style="font-size:13px;font-weight:700;color:{color};margin:2px 0;">{disp_sym}</div>
+            <div style="font-size:10px;color:{MUTED};">Expiry: {expiry}</div>
+            <div style="display:flex;gap:20px;margin-top:8px;">
+                <div>
+                    <div style="font-size:9px;color:{MUTED};">LTP (₹)</div>
+                    <div style="font-size:20px;font-weight:800;color:{color};">{ltp:,.2f}</div>
+                </div>
+                <div>
+                    <div style="font-size:9px;color:{MUTED};">Futures OI</div>
+                    <div style="font-size:16px;font-weight:700;color:{TEXT};">{oi_str}</div>
+                </div>
+                <div>
+                    <div style="font-size:9px;color:{MUTED};">Volume</div>
+                    <div style="font-size:16px;font-weight:700;color:{TEXT};">{vol_str}</div>
+                </div>
+                <div>
+                    <div style="font-size:9px;color:{MUTED};">Vol/OI</div>
+                    <div style="font-size:16px;font-weight:700;color:{TEXT};">{voi_str}</div>
+                </div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+    with _contract_cols[0]:
+        _contract_card(_contract_cols[0], "NEAR MONTH", GOLD,
+                       roll["near_ltp"], roll["near_oi"], roll["near_vol"], roll["near_vol_oi"],
+                       roll["near_expiry"], roll.get("near_tsym","NEAR"))
+    with _contract_cols[1]:
+        _contract_card(_contract_cols[1], "NEXT MONTH", "#CE93D8",
+                       roll["next_ltp"], roll["next_oi"], roll["next_vol"], roll["next_vol_oi"],
+                       roll["next_expiry"], roll.get("next_tsym","NEXT"))
+    if _has_far:
+        with _contract_cols[2]:
+            _contract_card(_contract_cols[2], "FAR MONTH", CYAN,
+                           roll["far_ltp"], roll["far_oi"], roll["far_vol"], roll["far_vol_oi"],
+                           roll["far_expiry"], roll.get("far_tsym","FAR"))
+
+    # ── Spread / Rollover row ──────────────────────────────────────────
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    _spr_cols = st.columns(4)
+    _spr_items = [
+        ("Near→Next Spread (₹)", f'{roll["roll_spread"]:+,.2f}', roll["bias_color"]),
+        ("Near→Next Spread (%)", f'{roll["roll_spread_pct"]:+.3f} %', roll["bias_color"]),
+        ("Rollover %",           f'{roll["rollover_pct"]} %', BLUE),
+        ("Structure",            roll["bias"], roll["bias_color"]),
+    ]
+    if _has_far:
+        nn_s = roll.get("next_ltp",0) - roll.get("near_ltp",0)
+        nf_s = roll.get("far_ltp",0)  - roll.get("next_ltp",0)
+        nf_pct = round(nf_s / roll["next_ltp"] * 100, 3) if roll.get("next_ltp",0) > 0 else 0
+        _spr_items = [
+            ("Near→Next (₹)", f'{nn_s:+,.2f}', roll["bias_color"]),
+            ("Next→Far (₹)",  f'{nf_s:+,.2f}',
+             "#00E676" if nf_s > 0 else ("#FF5252" if nf_s < 0 else "#FFD600")),
+            ("Rollover %",    f'{roll["rollover_pct"]} %', BLUE),
+            ("Structure",     roll["bias"], roll["bias_color"]),
+        ]
+    for col, (lbl, val, clr) in zip(_spr_cols, _spr_items):
+        col.markdown(f"""
+        <div style="background:{CARD};border-radius:8px;padding:8px 12px;border:1px solid {BORDER};margin-top:4px;">
+            <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">{lbl}</div>
+            <div style="font-size:16px;font-weight:700;color:{clr};">{val}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── Charts: OI bar (near/next/far) + Intraday OI curve ───────────
     roll_chart_cols = st.columns(2)
     with roll_chart_cols[0]:
+        _bar_x     = [roll.get("near_tsym","Near")[-7:], roll.get("next_tsym","Next")[-7:]]
+        _bar_oi    = [roll["near_oi"], roll["next_oi"]]
+        _bar_vol   = [roll.get("near_vol",0), roll.get("next_vol",0)]
+        _bar_color = [GOLD, "#CE93D8"]
+        _bar_vcol  = ["rgba(212,175,55,0.5)", "rgba(206,147,216,0.5)"]
+        if _has_far:
+            _bar_x.append(roll.get("far_tsym","Far")[-7:])
+            _bar_oi.append(roll["far_oi"]); _bar_vol.append(roll.get("far_vol",0))
+            _bar_color.append(CYAN); _bar_vcol.append("rgba(0,229,255,0.4)")
         f_roll = go.Figure([
-            go.Bar(name="Near Month OI",  x=["Near","Next"],y=[roll["near_oi"],roll["next_oi"]],  marker_color=[GOLD,"#CE93D8"]),
-            go.Bar(name="Volume",         x=["Near","Next"],y=[roll.get("near_vol",0),roll.get("next_vol",0)],
-                   marker_color=["rgba(212,175,55,0.5)","rgba(206,147,216,0.5)"]),
+            go.Bar(name="Futures OI", x=_bar_x, y=_bar_oi,  marker_color=_bar_color,
+                   hovertemplate="<b>%{x}</b><br>OI: %{y:,}<extra></extra>"),
+            go.Bar(name="Volume",     x=_bar_x, y=_bar_vol, marker_color=_bar_vcol,
+                   hovertemplate="<b>%{x}</b><br>Vol: %{y:,}<extra></extra>"),
         ])
-        f_roll.add_annotation(text=roll["bias"],xref="paper",yref="paper",x=0.5,y=1.12,
-                              showarrow=False,font=dict(color=roll["bias_color"],size=12))
-        f_roll.update_layout(**chart_layout(title="Near vs Next Month OI & Volume",barmode="group"),
-                             legend=dict(orientation="h",y=1.02,x=0))
+        f_roll.add_annotation(text=roll["bias"], xref="paper", yref="paper", x=0.5, y=1.12,
+                              showarrow=False, font=dict(color=roll["bias_color"], size=12))
+        f_roll.update_layout(**chart_layout(title="Futures OI & Volume by Contract", barmode="group"),
+                             legend=dict(orientation="h", y=1.02, x=0))
         st.plotly_chart(f_roll, use_container_width=True, config={"displayModeBar":False})
+
     with roll_chart_cols[1]:
         oi_hist = st.session_state["oi_history"].get(symbol, [])
         if len(oi_hist) >= 2:
-            ts_v  = [r["ts"] for r in oi_hist]; near = [r["near_oi"] for r in oi_hist]
-            nxt   = [r["next_oi"] for r in oi_hist]; total = [r["total_oi"] for r in oi_hist]
+            ts_v  = [r["ts"] for r in oi_hist]
+            near  = [r["near_oi"]  for r in oi_hist]
+            nxt   = [r["next_oi"]  for r in oi_hist]
+            total = [r["total_oi"] for r in oi_hist]
             f_oi  = go.Figure([
-                go.Scatter(x=ts_v,y=total,mode="lines",name="Total OI",  line=dict(color=CYAN,width=2)),
-                go.Scatter(x=ts_v,y=near, mode="lines",name="Near OI",   line=dict(color=GOLD,width=1.5,dash="dot")),
-                go.Scatter(x=ts_v,y=nxt,  mode="lines",name="Next OI",   line=dict(color="#CE93D8",width=1.5,dash="dot")),
+                go.Scatter(x=ts_v, y=total, mode="lines", name="Total OI",
+                           line=dict(color=CYAN,  width=2)),
+                go.Scatter(x=ts_v, y=near,  mode="lines", name=roll.get("near_tsym","Near")[-7:],
+                           line=dict(color=GOLD,  width=1.5, dash="dot")),
+                go.Scatter(x=ts_v, y=nxt,   mode="lines", name=roll.get("next_tsym","Next")[-7:],
+                           line=dict(color="#CE93D8", width=1.5, dash="dot")),
             ])
-            f_oi.update_layout(**chart_layout(title="Intraday OI Curve (Today's Session)"),
-                               legend=dict(orientation="h",y=1.08,x=0),xaxis_title="Time",yaxis_title="Open Interest")
+            f_oi.update_layout(**chart_layout(title="Intraday Futures OI Curve (Today's Session)"),
+                               legend=dict(orientation="h", y=1.08, x=0),
+                               xaxis_title="Time", yaxis_title="Open Interest")
         else:
             f_oi = go.Figure()
-            f_oi.add_annotation(text="Collecting OI history… refresh a few times",xref="paper",yref="paper",
-                                x=0.5,y=0.5,showarrow=False,font=dict(color=MUTED,size=13))
+            f_oi.add_annotation(text="Collecting OI history… refresh a few times",
+                                xref="paper", yref="paper", x=0.5, y=0.5,
+                                showarrow=False, font=dict(color=MUTED, size=13))
             f_oi.update_layout(**chart_layout(title="Intraday OI Curve (Building…)"))
         st.plotly_chart(f_oi, use_container_width=True, config={"displayModeBar":False})
 else:
