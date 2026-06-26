@@ -264,9 +264,12 @@ def _solve_iv(mkt, S, K, T, r, opt):
 
 # ─────────────────────────────────────────────────────────────────────
 #  DHAN FETCHERS
-#  Cache option chain calls for 55s (just under the 60s refresh cycle).
+#  Cache option chain AND futures-roll calls for 55s (just under the
+#  60s refresh cycle) so concurrent viewers share API calls instead of
+#  hitting Dhan per-visitor.
 #  fetch_futures_roll() uses /v2/marketfeed/quote (not option chain), so
-#  total Dhan API calls per refresh: expiry list + option chain + quote = 3.
+#  total Dhan API calls per cold 55s window: expiry list + option chain
+#  + quote = 3 (then cached for the rest of the window).
 # ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_dhan_expiry_list(symbol="GOLDM"):
@@ -340,7 +343,10 @@ def fetch_dhan_option_chain(symbol="GOLDM", expiry=None):
 #  Falls back to /v2/marketfeed/ltp if quote gives no prices.
 #  Expiry dates come from master CSV via get_futures_contracts() — no
 #  option-chain expiry-list or _fetch_oi calls, so zero extra API hits.
+#  Cached for 55s (matching option-chain fetchers) so concurrent viewers
+#  share one quote call per 55s window instead of hitting Dhan per visitor.
 # ─────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=55, show_spinner=False)
 def fetch_futures_roll(symbol="GOLDM") -> dict:
     if not CFG.USE_DHAN: return {}
 
