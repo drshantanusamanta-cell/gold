@@ -953,6 +953,159 @@ def compute_rollover_velocity_zscore(oi_history, symbol):
     return round(z, 2), interp, color
 
 # ─────────────────────────────────────────────────────────────────────
+#  COMBINED MARKET BIAS — Options + Futures unified decision matrix
+#  v4-surgical: added to satisfy "combined Market Bias decision matrix"
+#  requirement. Reads existing m / roll / iv_smile_result / g_regime /
+#  carry_anomaly / roll_vel_z signals — does NOT mutate them.
+# ─────────────────────────────────────────────────────────────────────
+def _bias_tag(bias, strength, color):
+    """Render a small colour-coded chip for inline bias explanations."""
+    if not bias: return ""
+    label = bias.title()
+    if strength and strength not in ("—", ""):
+        label = f"{label} ({strength})"
+    return (f"<span style='background:{color}22;color:{color};border:1px solid {color};"
+            f"border-radius:5px;padding:1px 7px;font-size:10px;font-weight:700;"
+            f"letter-spacing:0.3px;white-space:nowrap;'>{label}</span>")
+
+def compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
+                                 carry_anomaly, roll_vel_z, score):
+    """Aggregate options + futures signals into a single decision matrix.
+
+    Each signal is scored as BULLISH / BEARISH / SIDEWAYS / TREND with an
+    optional strength qualifier. The net directional score decides the
+    final verdict that is displayed at the top of the dashboard.
+    """
+    signals = []
+
+    def _add(name, value, bias, strength, color, source):
+        signals.append({"name": name, "value": value, "bias": bias,
+                        "strength": strength, "color": color, "source": source})
+
+    # ── OPTIONS SIGNALS ──────────────────────────────────────────────
+    nd = safe_num(m.get("net_delta", 0))
+    if   nd >=  5000: _add("Net Delta", f"{int(nd):,}",       "BULLISH", "Strong", GREEN,  "Options")
+    elif nd >=  1000: _add("Net Delta", f"{int(nd):,}",       "BULLISH", "Mild",   "#69F0AE", "Options")
+    elif nd <= -5000: _add("Net Delta", f"{int(nd):,}",       "BEARISH", "Strong", RED,    "Options")
+    elif nd <= -1000: _add("Net Delta", f"{int(nd):,}",       "BEARISH", "Mild",   "#FF6D00", "Options")
+    else:             _add("Net Delta", f"{int(nd):,}",       "SIDEWAYS","—",      MUTED,   "Options")
+
+    mom = safe_num(m.get("momentum", 0))
+    if   mom >=  2000: _add("Momentum", f"{int(mom):,}",      "BULLISH", "Strong", GREEN,  "Options")
+    elif mom >=   500: _add("Momentum", f"{int(mom):,}",      "BULLISH", "Mild",   "#69F0AE", "Options")
+    elif mom <= -2000: _add("Momentum", f"{int(mom):,}",      "BEARISH", "Strong", RED,    "Options")
+    elif mom <=  -500: _add("Momentum", f"{int(mom):,}",      "BEARISH", "Mild",   "#FF6D00", "Options")
+    else:              _add("Momentum", f"{int(mom):,}",      "SIDEWAYS","—",      MUTED,   "Options")
+
+    ev = safe_num(m.get("ev_ratio", 1.0))
+    if   ev >= 1.3: _add("EV Ratio", f"{ev:.2f}", "BULLISH", "Strong", GREEN,    "Options")
+    elif ev >= 1.1: _add("EV Ratio", f"{ev:.2f}", "BULLISH", "Mild",   "#69F0AE", "Options")
+    elif ev <= 0.7: _add("EV Ratio", f"{ev:.2f}", "BEARISH", "Strong", RED,      "Options")
+    elif ev <= 0.9: _add("EV Ratio", f"{ev:.2f}", "BEARISH", "Mild",   "#FF6D00", "Options")
+    else:           _add("EV Ratio", f"{ev:.2f}", "SIDEWAYS","—",      MUTED,     "Options")
+
+    pcr = safe_num(m.get("pcr", 1.0))
+    if   pcr >= 1.3: _add("PCR", f"{pcr:.2f}", "BULLISH", "Strong", GREEN,    "Options")
+    elif pcr >= 1.0: _add("PCR", f"{pcr:.2f}", "BULLISH", "Mild",   "#69F0AE", "Options")
+    elif pcr <= 0.5: _add("PCR", f"{pcr:.2f}", "BEARISH", "Strong", RED,      "Options")
+    elif pcr <= 0.7: _add("PCR", f"{pcr:.2f}", "BEARISH", "Mild",   "#FF6D00", "Options")
+    else:            _add("PCR", f"{pcr:.2f}", "SIDEWAYS","—",      MUTED,     "Options")
+
+    gex = safe_num(m.get("gex", 0))
+    if   gex >  1e8: _add("GEX", f"{gex:,.0f}", "SIDEWAYS","Pinned",  BLUE,    "Options")
+    elif gex >  0:   _add("GEX", f"{gex:,.0f}", "SIDEWAYS","Stable",  CYAN,    "Options")
+    elif gex < -1e8: _add("GEX", f"{gex:,.0f}", "TREND",   "Volatile",AMBER,   "Options")
+    else:            _add("GEX", f"{gex:,.0f}", "TREND",   "Mild",    "#9333EA","Options")
+
+    atp = safe_num(m.get("atm_pressure", 0))
+    if   atp >=  2000: _add("ATM Pressure", f"{int(atp):,}", "BULLISH", "Strong", GREEN,    "Options")
+    elif atp >      0: _add("ATM Pressure", f"{int(atp):,}", "BULLISH", "Mild",   "#69F0AE", "Options")
+    elif atp <= -2000: _add("ATM Pressure", f"{int(atp):,}", "BEARISH", "Strong", RED,      "Options")
+    elif atp <      0: _add("ATM Pressure", f"{int(atp):,}", "BEARISH", "Mild",   "#FF6D00", "Options")
+    else:              _add("ATM Pressure", f"{int(atp):,}", "SIDEWAYS","—",      MUTED,     "Options")
+
+    g_up = (g_regime or "").upper()
+    if   "PINNED" in g_up or "RANGE" in g_up: _add("Gamma Regime", g_regime, "SIDEWAYS","Pin",     BLUE,  "Options")
+    elif "FLIP"   in g_up:                    _add("Gamma Regime", g_regime, "TREND",   "Unstable",RED,   "Options")
+    elif "TREND"  in g_up or "EXPANSION" in g_up: _add("Gamma Regime", g_regime, "TREND","Volatile",AMBER,"Options")
+    else:                                     _add("Gamma Regime", g_regime, "SIDEWAYS","Transitional",MUTED,"Options")
+
+    if iv_smile_result:
+        scn = (iv_smile_result.get("scenario","") or "").upper()
+        col = iv_smile_result.get("color", MUTED)
+        if   "CALL SKEW" in scn or "BREAKOUT" in scn: _add("IV Smile", iv_smile_result.get("scenario",""), "BULLISH","—",col,"Options")
+        elif "PUT SKEW" in scn or "CRASH" in scn or "PANIC" in scn: _add("IV Smile", iv_smile_result.get("scenario",""), "BEARISH","—",col,"Options")
+        elif "SYMMETRIC" in scn or "WIDE" in scn:      _add("IV Smile", iv_smile_result.get("scenario",""), "TREND","Volatile",col,"Options")
+        else:                                          _add("IV Smile", iv_smile_result.get("scenario",""), "SIDEWAYS","—",col,"Options")
+
+    # ── FUTURES SIGNALS ──────────────────────────────────────────────
+    if roll:
+        rsp = safe_num(roll.get("roll_spread_pct", 0))
+        rs  = safe_num(roll.get("roll_spread", 0))
+        if   rsp >  0.2: _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Strong",GREEN,    "Futures")
+        elif rsp >  0:   _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Mild",  "#69F0AE","Futures")
+        elif rsp < -0.2: _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Strong",RED,      "Futures")
+        elif rsp <  0:   _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Mild",  "#FF6D00","Futures")
+        else:            _add("Roll Spread",  f"₹{rs:+,.2f}",               "SIDEWAYS","—",    MUTED,    "Futures")
+
+        tsb = safe_num(roll.get("ts_bias", 0))
+        tss = roll.get("ts_shape", "—")
+        if   tsb >=  2: _add("Term Structure", tss, "BULLISH","Strong",GREEN,    "Futures")
+        elif tsb ==  1: _add("Term Structure", tss, "BULLISH","Mild",  "#69F0AE","Futures")
+        elif tsb <= -2: _add("Term Structure", tss, "BEARISH","Strong",RED,      "Futures")
+        elif tsb == -1: _add("Term Structure", tss, "BEARISH","Mild",  "#FF6D00","Futures")
+        else:           _add("Term Structure", tss, "SIDEWAYS","—",    MUTED,    "Futures")
+
+        ca = safe_num(carry_anomaly, 1.0)
+        if   ca >= 1.5: _add("Carry Anomaly", f"{ca:.2f}×", "TREND","Big move priced", RED,  "Futures")
+        elif ca <= 0.5: _add("Carry Anomaly", f"{ca:.2f}×", "SIDEWAYS","Normal carry", GREEN,"Futures")
+        else:           _add("Carry Anomaly", f"{ca:.2f}×", "SIDEWAYS","—",            MUTED,"Futures")
+
+        rv = safe_num(roll.get("rollover_velocity", 0.8))
+        if   rv >= 1.3: _add("Rollover Velocity", f"{rv:.2f}", "BULLISH","Conviction", GREEN,    "Futures")
+        elif rv >= 0.8: _add("Rollover Velocity", f"{rv:.2f}", "SIDEWAYS","Normal",    CYAN,     "Futures")
+        elif rv >= 0.3: _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Slow",       AMBER,    "Futures")
+        else:           _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Liquidation",RED,      "Futures")
+
+        rp = safe_num(roll.get("rollover_pct", 0))
+        if   rp >= 40:  _add("Rollover %", f"{rp:.0f}%", "BULLISH","Advanced",   GREEN,"Futures")
+        elif rp >= 20:  _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Normal",    CYAN, "Futures")
+        else:           _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Early",     MUTED,"Futures")
+
+        if roll_vel_z is not None:
+            rz = safe_num(roll_vel_z, 0)
+            if   rz >=  1.0: _add("Roll Vel Z", f"{rz:+.2f}σ", "BULLISH","Above norm", GREEN,    "Futures")
+            elif rz <= -1.0: _add("Roll Vel Z", f"{rz:+.2f}σ", "BEARISH","Below norm", RED,      "Futures")
+            else:            _add("Roll Vel Z", f"{rz:+.2f}σ", "SIDEWAYS","—",         MUTED,    "Futures")
+
+    # ── AGGREGATE ────────────────────────────────────────────────────
+    def _w(s): return 2 if s["strength"] == "Strong" else (1 if s["strength"] not in ("—","") else 0)
+    bull_score    = sum(_w(s) for s in signals if s["bias"] == "BULLISH")
+    bear_score    = sum(_w(s) for s in signals if s["bias"] == "BEARISH")
+    sideways_cnt  = sum(1 for s in signals if s["bias"] == "SIDEWAYS")
+    trend_cnt     = sum(1 for s in signals if s["bias"] == "TREND")
+    net = bull_score - bear_score
+
+    if   net >=  5: verdict, v_color = "STRONG BULLISH 🚀",   GREEN
+    elif net >=  2: verdict, v_color = "BULLISH 📈",          "#69F0AE"
+    elif net <= -5: verdict, v_color = "STRONG BEARISH 📉",   RED
+    elif net <= -2: verdict, v_color = "BEARISH ⚠",           "#FF6D00"
+    elif trend_cnt >= 3: verdict, v_color = "VOLATILE / EXPANSION ⚡", "#9333EA"
+    elif sideways_cnt >= 5: verdict, v_color = "SIDEWAYS / RANGE-BOUND ↔", BLUE
+    else: verdict, v_color = "NEUTRAL / TRANSITIONAL",        MUTED
+
+    return {
+        "signals": signals,
+        "verdict": verdict,
+        "verdict_color": v_color,
+        "bull_score": bull_score,
+        "bear_score": bear_score,
+        "sideways_count": sideways_cnt,
+        "trend_count": trend_cnt,
+        "net_score": net,
+    }
+
+# ─────────────────────────────────────────────────────────────────────
 #  CHARTS — original + new v4
 # ─────────────────────────────────────────────────────────────────────
 def chart_layout(**kw):
@@ -1174,7 +1327,7 @@ is_owner = st.session_state["is_owner"]
 st.markdown(f"""
 <div style="text-align:center;margin-bottom:14px;border-bottom:2px solid {ACCENT};padding-bottom:10px;">
     <h1 style="margin:0;color:{GOLD};font-size:26px;font-weight:800;letter-spacing:1px;">
-        🌟 Commodities Options Analysis v4
+        🌟 Shantanu's Commodity Analysis Dashboard
     </h1>
     <div style="font-size:11px;color:{MUTED};margin-top:3px;">
         MCX GOLDM & SILVERM · Term Structure · Gamma Regime · IV Smile · OI Velocity · Regime Detection
@@ -1340,6 +1493,111 @@ for col, (label, value, color) in zip(header_cols, header_data):
 
 st.markdown("---")
 
+# ── COMBINED MARKET BIAS DECISION MATRIX (Options + Futures) ─────────
+# v4-surgical: top-of-dashboard unified decision matrix combining signals
+# from both the options chain and the futures roll. Does NOT modify any
+# existing logic — only reads computed values and renders a new section.
+combined_bias = compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
+                                             carry_anomaly, roll_vel_z, score)
+_cb = combined_bias
+st.markdown('<div class="section-header">🧭 Combined Market Bias Decision Matrix — Options + Futures</div>',
+            unsafe_allow_html=True)
+
+# Verdict banner with bull / bear / sideways strength meter
+_bull_pct    = max(0, _cb["bull_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"] + _cb["trend_count"]) * 100
+_bear_pct    = max(0, _cb["bear_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"] + _cb["trend_count"]) * 100
+_side_pct    = 100 - _bull_pct - _bear_pct
+
+st.markdown(f"""
+<div style="background:{_cb['verdict_color']}15;border:1.5px solid {_cb['verdict_color']};
+            border-radius:10px;padding:14px 20px;margin-bottom:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <div style="font-size:18px;font-weight:800;color:{_cb['verdict_color']};letter-spacing:0.5px;">
+            🎯 {_cb['verdict']}
+        </div>
+        <div style="display:flex;gap:8px;font-size:11px;font-weight:700;">
+            <span style="background:{GREEN}22;color:{GREEN};border:1px solid {GREEN};border-radius:6px;padding:3px 10px;">
+                🐂 Bull: {_cb['bull_score']}
+            </span>
+            <span style="background:{RED}22;color:{RED};border:1px solid {RED};border-radius:6px;padding:3px 10px;">
+                🐻 Bear: {_cb['bear_score']}
+            </span>
+            <span style="background:{BLUE}22;color:{BLUE};border:1px solid {BLUE};border-radius:6px;padding:3px 10px;">
+                ↔ Sideways: {_cb['sideways_count']}
+            </span>
+            <span style="background:#9333EA22;color:#9333EA;border:1px solid #9333EA;border-radius:6px;padding:3px 10px;">
+                ⚡ Trend: {_cb['trend_count']}
+            </span>
+        </div>
+    </div>
+    <div style="font-size:11px;color:{MUTED};margin-top:6px;">
+        Net directional score: <b style="color:{_cb['verdict_color']};">{_cb['net_score']:+d}</b>
+        &nbsp;·&nbsp; Aggregated from {len(_cb['signals'])} live signals
+        (Options + Futures). Strength qualifier ("Strong" / "Mild") scales each
+        signal's weight in the net score.
+    </div>
+    <!-- Strength meter bar -->
+    <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-top:10px;border:1px solid {BORDER};">
+        <div style="width:{_bull_pct:.1f}%;background:{GREEN};"></div>
+        <div style="width:{_side_pct:.1f}%;background:{BLUE};opacity:0.5;"></div>
+        <div style="width:{_bear_pct:.1f}%;background:{RED};"></div>
+    </div>
+</div>""", unsafe_allow_html=True)
+
+# Signal matrix — split Options vs Futures into two columns
+_opt_signals = [s for s in _cb["signals"] if s["source"] == "Options"]
+_fut_signals = [s for s in _cb["signals"] if s["source"] == "Futures"]
+
+def _render_signal_cell(s):
+    return f"""
+    <div style="background:{CARD};border:1px solid {BORDER};border-left:3px solid {s['color']};
+                border-radius:6px;padding:8px 10px;display:flex;justify-content:space-between;
+                align-items:center;gap:6px;min-height:48px;">
+        <div style="flex:1;min-width:0;">
+            <div style="font-size:10px;color:{MUTED};text-transform:uppercase;letter-spacing:0.4px;
+                        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{s['name']}</div>
+            <div style="font-size:13px;font-weight:700;color:{TEXT};white-space:nowrap;
+                        overflow:hidden;text-overflow:ellipsis;">{s['value']}</div>
+        </div>
+        <div style="flex-shrink:0;">{_bias_tag(s['bias'], s['strength'], s['color'])}</div>
+    </div>"""
+
+_mx_cols = st.columns(2)
+with _mx_cols[0]:
+    st.markdown(f"""<div style="font-size:11px;font-weight:700;color:{GOLD};
+                text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">
+                📊 Options Signals ({len(_opt_signals)})</div>""", unsafe_allow_html=True)
+    for s in _opt_signals:
+        st.markdown(_render_signal_cell(s), unsafe_allow_html=True)
+with _mx_cols[1]:
+    _fut_label_color = CYAN if _fut_signals else MUTED
+    st.markdown(f"""<div style="font-size:11px;font-weight:700;color:{_fut_label_color};
+                text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">
+                📦 Futures Signals ({len(_fut_signals)})</div>""", unsafe_allow_html=True)
+    if _fut_signals:
+        for s in _fut_signals:
+            st.markdown(_render_signal_cell(s), unsafe_allow_html=True)
+    else:
+        st.markdown(f"""<div style="background:{CARD};border:1px dashed {BORDER};border-radius:6px;
+                    padding:12px;text-align:center;color:{MUTED};font-size:11px;">
+                    Roll data unavailable — futures signals will populate when MCX market is open.
+                    </div>""", unsafe_allow_html=True)
+
+# Plain-English legend explaining how to read the matrix
+st.markdown(f"""
+<div style="background:{SECTION_BG};border-radius:8px;padding:8px 14px;margin-top:8px;
+            font-size:11px;color:{MUTED};line-height:1.5;">
+    <b>How to read this matrix:</b> Each cell shows a live metric with a colour-coded bias chip —
+    <span style="color:{GREEN};font-weight:700;">🟢 BULLISH</span>,
+    <span style="color:{RED};font-weight:700;">🔴 BEARISH</span>,
+    <span style="color:{BLUE};font-weight:700;">🔵 SIDEWAYS</span> (range / pinned),
+    or <span style="color:#9333EA;font-weight:700;">🟣 TREND</span> (volatile / expansion).
+    "Strong" signals carry 2× the weight of "Mild" signals. The verdict at the top is the
+    net of all bullish minus bearish scores; ties fall back to a sideways or volatile verdict.
+</div>""", unsafe_allow_html=True)
+
+st.markdown("---")
+
 # ── SCORE + STRATEGY + METRICS ────────────────────────────────────────
 col_gauge, col_strat, col_metrics = st.columns([1,1.2,3])
 with col_gauge:
@@ -1487,7 +1745,7 @@ if roll:
     _ncols   = 3 if _has_far else 2
     _contract_cols = st.columns(_ncols)
 
-    def _contract_card(col, label, color, ltp, oi, vol, vol_oi, expiry, tsym):
+    def _contract_card(col, label, color, ltp, oi, vol, vol_oi, expiry, tsym, bias_html):
         oi_str   = f"{oi:,}"  if oi  > 0 else "—"
         vol_str  = f"{vol:,}" if vol > 0 else "—"
         voi_str  = f"{vol_oi:.3f}" if vol_oi > 0 else "—"
@@ -1517,47 +1775,107 @@ if roll:
                     <div style="font-size:16px;font-weight:700;color:{TEXT};">{voi_str}</div>
                 </div>
             </div>
+            <div style="margin-top:8px;padding-top:6px;border-top:1px dashed {BORDER};
+                        font-size:10px;color:{MUTED};line-height:1.4;">
+                {bias_html}
+            </div>
         </div>""", unsafe_allow_html=True)
+
+    # ── v4-surgical: plain-English bias lines for each contract card ──
+    _near_voi    = safe_num(roll.get("near_vol_oi", 0))
+    _near_voi_b  = ("BULLISH" if _near_voi > 0.3 else "SIDEWAYS") if _near_voi > 0 else "SIDEWAYS"
+    _near_voi_s  = "Active fresh positioning" if _near_voi > 0.3 else ("Normal" if _near_voi > 0 else "—")
+    _near_voi_c  = GREEN if _near_voi > 0.3 else (CYAN if _near_voi > 0 else MUTED)
+
+    _next_voi    = safe_num(roll.get("next_vol_oi", 0))
+    _next_voi_b  = ("BULLISH" if _next_voi > 0.3 else "SIDEWAYS") if _next_voi > 0 else "SIDEWAYS"
+    _next_voi_s  = "Active rollover flow" if _next_voi > 0.3 else ("Normal" if _next_voi > 0 else "—")
+    _next_voi_c  = GREEN if _next_voi > 0.3 else (CYAN if _next_voi > 0 else MUTED)
+
+    _rollover_pct_val = safe_num(roll.get("rollover_pct", 0))
+    if   _rollover_pct_val >= 40: _rollp_b, _rollp_s, _rollp_c = "BULLISH", "Advanced rollover", GREEN
+    elif _rollover_pct_val >= 20: _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Normal pace",     CYAN
+    else:                         _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Early / cautious", MUTED
+
+    _near_bias_html = (
+        f"{_bias_tag(_near_voi_b, _near_voi_s, _near_voi_c)} "
+        f"<span style='color:{TEXT};'>Near-month carries the most liquidity — high Vol/OI means fresh directional bets are being placed.</span>"
+    )
+    _next_bias_html = (
+        f"{_bias_tag(_rollp_b, _rollp_s, _rollp_c)} "
+        f"<span style='color:{TEXT};'>Next-month OI shows rollover conviction — high % means longs are rolling forward with conviction.</span>"
+    )
+    _far_bias_html = (
+        f"{_bias_tag('SIDEWAYS', '—', MUTED)} "
+        f"<span style='color:{TEXT};'>Far-month is the long-term view — thin OI is normal; rising OI here signals strategic positioning.</span>"
+    )
 
     with _contract_cols[0]:
         _contract_card(_contract_cols[0], "NEAR MONTH", GOLD,
                        roll["near_ltp"], roll["near_oi"], roll["near_vol"], roll["near_vol_oi"],
-                       roll["near_expiry"], roll.get("near_tsym","NEAR"))
+                       roll["near_expiry"], roll.get("near_tsym","NEAR"), _near_bias_html)
     with _contract_cols[1]:
         _contract_card(_contract_cols[1], "NEXT MONTH", "#CE93D8",
                        roll["next_ltp"], roll["next_oi"], roll["next_vol"], roll["next_vol_oi"],
-                       roll["next_expiry"], roll.get("next_tsym","NEXT"))
+                       roll["next_expiry"], roll.get("next_tsym","NEXT"), _next_bias_html)
     if _has_far:
         with _contract_cols[2]:
             _contract_card(_contract_cols[2], "FAR MONTH", CYAN,
                            roll["far_ltp"], roll["far_oi"], roll["far_vol"], roll["far_vol_oi"],
-                           roll["far_expiry"], roll.get("far_tsym","FAR"))
+                           roll["far_expiry"], roll.get("far_tsym","FAR"), _far_bias_html)
 
     # ── Spread / Rollover row ──────────────────────────────────────────
     st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
     _spr_cols = st.columns(4)
+
+    # v4-surgical: helper to compute plain-English bias for a spread %
+    def _spread_bias(pct):
+        if   pct >  0.2: return "BULLISH", "Strong contango", GREEN
+        elif pct >  0:   return "BULLISH", "Mild contango",   "#69F0AE"
+        elif pct < -0.2: return "BEARISH", "Strong backwardation", RED
+        elif pct <  0:   return "BEARISH", "Mild backwardation",   "#FF6D00"
+        else:            return "SIDEWAYS", "Flat / no carry",      MUTED
+
+    # v4-surgical: plain-English bias lines for spread / rollover row
+    _rsp = safe_num(roll.get("roll_spread_pct", 0))
+    _rs_b, _rs_s, _rs_c = _spread_bias(_rsp)
+    _rp_b, _rp_s, _rp_c = (_rollp_b, _rollp_s, _rollp_c)
+    _st_b = "BULLISH" if "CONTANGO" in (roll.get("bias","") or "").upper() else ("BEARISH" if "BACKWARDATION" in (roll.get("bias","") or "").upper() else "SIDEWAYS")
+    _st_s = "Carry positive" if _st_b == "BULLISH" else ("Delivery pressure" if _st_b == "BEARISH" else "Indecisive")
+    _st_c = roll.get("bias_color", MUTED)
+
     _spr_items = [
-        ("Near→Next Spread (₹)", f'{roll["roll_spread"]:+,.2f}', roll["bias_color"]),
-        ("Near→Next Spread (%)", f'{roll["roll_spread_pct"]:+.3f} %', roll["bias_color"]),
-        ("Rollover %",           f'{roll["rollover_pct"]} %', BLUE),
-        ("Structure",            roll["bias"], roll["bias_color"]),
+        ("Near→Next Spread (₹)", f'{roll["roll_spread"]:+,.2f}', roll["bias_color"],
+         _bias_tag(_rs_b, _rs_s, _rs_c) + f" <span style='color:{TEXT};'>Next month pricier than near = cost-of-carry, bullish for trend.</span>"),
+        ("Near→Next Spread (%)", f'{roll["roll_spread_pct"]:+.3f} %', roll["bias_color"],
+         _bias_tag(_rs_b, _rs_s, _rs_c) + f" <span style='color:{TEXT};'>Same spread as % of price — annualised carry signal.</span>"),
+        ("Rollover %",           f'{roll["rollover_pct"]} %', BLUE,
+         _bias_tag(_rp_b, _rp_s, _rp_c) + f" <span style='color:{TEXT};'>Share of OI already in next month — high = conviction roll.</span>"),
+        ("Structure",            roll["bias"], roll["bias_color"],
+         _bias_tag(_st_b, _st_s, _st_c) + f" <span style='color:{TEXT};'>Curve shape: contango = normal carry, backwardation = supply squeeze.</span>"),
     ]
     if _has_far:
         nn_s = roll.get("next_ltp",0) - roll.get("near_ltp",0)
         nf_s = roll.get("far_ltp",0)  - roll.get("next_ltp",0)
         nf_pct = round(nf_s / roll["next_ltp"] * 100, 3) if roll.get("next_ltp",0) > 0 else 0
+        _nf_b, _nf_s, _nf_c = _spread_bias(nf_pct)
         _spr_items = [
-            ("Near→Next (₹)", f'{nn_s:+,.2f}', roll["bias_color"]),
+            ("Near→Next (₹)", f'{nn_s:+,.2f}', roll["bias_color"],
+             _bias_tag(_rs_b, _rs_s, _rs_c) + f" <span style='color:{TEXT};'>Front of curve — positive = contango (bullish carry).</span>"),
             ("Next→Far (₹)",  f'{nf_s:+,.2f}',
-             "#00E676" if nf_s > 0 else ("#FF5252" if nf_s < 0 else "#FFD600")),
-            ("Rollover %",    f'{roll["rollover_pct"]} %', BLUE),
-            ("Structure",     roll["bias"], roll["bias_color"]),
+             "#00E676" if nf_s > 0 else ("#FF5252" if nf_s < 0 else "#FFD600"),
+             _bias_tag(_nf_b, _nf_s, _nf_c) + f" <span style='color:{TEXT};'>Back of curve — positive = bullish long-dated view.</span>"),
+            ("Rollover %",    f'{roll["rollover_pct"]} %', BLUE,
+             _bias_tag(_rp_b, _rp_s, _rp_c) + f" <span style='color:{TEXT};'>OI migration to next month — high = conviction roll.</span>"),
+            ("Structure",     roll["bias"], roll["bias_color"],
+             _bias_tag(_st_b, _st_s, _st_c) + f" <span style='color:{TEXT};'>Curve shape verdict — contango vs backwardation.</span>"),
         ]
-    for col, (lbl, val, clr) in zip(_spr_cols, _spr_items):
+    for col, (lbl, val, clr, bias_html) in zip(_spr_cols, _spr_items):
         col.markdown(f"""
         <div style="background:{CARD};border-radius:8px;padding:8px 12px;border:1px solid {BORDER};margin-top:4px;">
             <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">{lbl}</div>
             <div style="font-size:16px;font-weight:700;color:{clr};">{val}</div>
+            <div style="font-size:10px;margin-top:4px;line-height:1.4;">{bias_html}</div>
         </div>""", unsafe_allow_html=True)
 
     # ── Charts: OI bar (near/next/far) + Intraday OI curve ───────────
@@ -1728,14 +2046,31 @@ with sec9_cols[0]:
     st.plotly_chart(build_term_structure_chart(roll), use_container_width=True, config={"displayModeBar":False})
     if roll:
         sc_nn = roll.get('slope_near_next',0); sc_nf = roll.get('slope_next_far',0)
+        # v4-surgical: inline bias chips for term-structure slopes
+        _nn_b = "BULLISH" if sc_nn > 0 else ("BEARISH" if sc_nn < 0 else "SIDEWAYS")
+        _nn_s = "Contango" if sc_nn > 0 else ("Backwardation" if sc_nn < 0 else "Flat")
+        _nn_c = GREEN if sc_nn > 0 else (RED if sc_nn < 0 else MUTED)
+        _nf_b = "BULLISH" if sc_nf > 0 else ("BEARISH" if sc_nf < 0 else "SIDEWAYS")
+        _nf_s = "Steepening" if sc_nf > 0 else ("Inverting" if sc_nf < 0 else "Flat")
+        _nf_c = GREEN if sc_nf > 0 else (RED if sc_nf < 0 else MUTED)
+        _tsb_val = safe_num(roll.get('ts_bias', 0))
+        _ts_card_b = ("BULLISH" if _tsb_val >= 1 else ("BEARISH" if _tsb_val <= -1 else "SIDEWAYS"))
+        _ts_card_s = ("Strong" if abs(_tsb_val) >= 2 else ("Mild" if abs(_tsb_val) == 1 else "—"))
+        _ts_card_c = roll.get('ts_color', MUTED)
         st.markdown(f"""
         <div style="background:{CARD};border-radius:8px;padding:8px 12px;border:1px solid {BORDER};margin-top:4px;font-size:11px;">
             <span style="color:{roll.get('ts_color',MUTED)};font-weight:700;">{roll.get('ts_shape','—')}</span>
             <span style="color:{MUTED};margin-left:8px;">{roll.get('ts_desc','')}</span><br>
             <span style="color:{MUTED};">Near→Next: </span>
             <span style="color:{GREEN if sc_nn>0 else RED};font-weight:600;">{sc_nn:+.2f}% p.a.</span>
+            {_bias_tag(_nn_b, _nn_s, _nn_c)}
             <span style="color:{MUTED};margin-left:10px;">Next→Far: </span>
             <span style="color:{GREEN if sc_nf>0 else RED};font-weight:600;">{sc_nf:+.2f}% p.a.</span>
+            {_bias_tag(_nf_b, _nf_s, _nf_c)}
+            <div style="margin-top:5px;padding-top:4px;border-top:1px dashed {BORDER};font-size:10px;color:{TEXT};line-height:1.4;">
+                {_bias_tag(_ts_card_b, _ts_card_s, _ts_card_c)}
+                <span>Curve shape tells you the carry trend — upward = bulls paying to hold, downward = delivery pressure.</span>
+            </div>
         </div>""", unsafe_allow_html=True)
 with sec9_cols[1]:
     st.plotly_chart(build_rollover_velocity_chart(st.session_state["oi_history"], symbol),
@@ -1744,33 +2079,59 @@ with sec9_cols[1]:
 # Carry Anomaly + metrics row
 sec9_mcols = st.columns(5)
 ca_color = RED if carry_anomaly >= 1.5 else (GREEN if carry_anomaly <= 0.5 else MUTED)
+# v4-surgical: bias chip + plain English for Carry Anomaly
+if   carry_anomaly >= 1.5: _ca_b, _ca_s = "TREND",    "Big move priced"
+elif carry_anomaly <= 0.5: _ca_b, _ca_s = "SIDEWAYS", "Normal carry"
+else:                       _ca_b, _ca_s = "SIDEWAYS", "—"
 with sec9_mcols[0]:
     st.markdown(f"""
     <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
         <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Carry Anomaly</div>
         <div style="font-size:20px;font-weight:700;color:{ca_color};">{carry_anomaly:.2f}×</div>
         <div class="explain-text">{METRIC_EXPLAIN['Carry Anomaly']}</div>
+        <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_ca_b, _ca_s, ca_color)}
+            <span style="color:{TEXT};">High = futures pricing a big move; low = calm carry.</span>
+        </div>
     </div>""", unsafe_allow_html=True)
 with sec9_mcols[1]:
     rv_zc = GREEN if roll_vel_z>=1.0 else (RED if roll_vel_z<=-1.0 else MUTED)
+    # v4-surgical: bias chip + plain English for Roll Vel Z-Score
+    if   roll_vel_z >= 1.0: _rvz_b, _rvz_s = "BULLISH", "Above norm"
+    elif roll_vel_z <= -1.0: _rvz_b, _rvz_s = "BEARISH", "Below norm"
+    else:                    _rvz_b, _rvz_s = "SIDEWAYS", "—"
     st.markdown(f"""
     <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
         <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Roll Vel Z-Score</div>
         <div style="font-size:20px;font-weight:700;color:{rv_zc};">{roll_vel_z:+.2f}σ</div>
         <div class="explain-text" style="color:{roll_vel_color};">{roll_vel_interp}</div>
+        <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_rvz_b, _rvz_s, rv_zc)}
+            <span style="color:{TEXT};">+σ = longs adding conviction; −σ = longs unwinding.</span>
+        </div>
     </div>""", unsafe_allow_html=True)
 if roll:
     nvo = roll.get("near_vol_oi",0)
     with sec9_mcols[2]:
         nvo_c = GREEN if nvo>0.3 else (AMBER if nvo>0.1 else MUTED)
+        # v4-surgical: bias chip + plain English for Near Vol/OI
+        if   nvo > 0.3:  _nvo_b, _nvo_s = "BULLISH",  "Active flow"
+        elif nvo > 0.1:  _nvo_b, _nvo_s = "SIDEWAYS", "Normal"
+        else:            _nvo_b, _nvo_s = "SIDEWAYS", "Quiet"
         st.markdown(f"""
         <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
             <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Near Vol/OI</div>
             <div style="font-size:20px;font-weight:700;color:{nvo_c};">{nvo:.3f}</div>
             <div class="explain-text">{METRIC_EXPLAIN['Near Vol/OI']}</div>
+            <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_nvo_b, _nvo_s, nvo_c)}
+                <span style="color:{TEXT};">High = fresh bets in near month; low = stale positioning.</span>
+            </div>
         </div>""", unsafe_allow_html=True)
     with sec9_mcols[3]:
         fl = roll.get("far_ltp",0)
+        # v4-surgical: bias chip + plain English for Far Month LTP
+        _nl = roll.get("near_ltp", 0); _xt = roll.get("next_ltp", 0)
+        if   fl > 0 and _xt > 0 and fl > _xt: _fl_b, _fl_s, _fl_c = "BULLISH",  "Steepening", GREEN
+        elif fl > 0 and _xt > 0 and fl < _xt: _fl_b, _fl_s, _fl_c = "BEARISH",  "Inverting",  RED
+        else:                                  _fl_b, _fl_s, _fl_c = "SIDEWAYS", "—",          CYAN
         st.markdown(f"""
         <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
             <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Far Month LTP</div>
@@ -1778,21 +2139,33 @@ if roll:
                 {'₹{:,.0f}'.format(fl) if fl>0 else '—'}
             </div>
             <div class="explain-text">3rd month futures — part of the term structure curve</div>
+            <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_fl_b, _fl_s, _fl_c)}
+                <span style="color:{TEXT};">Far > Next = long-dated bullish view; Far < Next = bearish inversion.</span>
+            </div>
         </div>""", unsafe_allow_html=True)
     tsb = roll.get("ts_bias",0)
     with sec9_mcols[4]:
+        # v4-surgical: bias chip + plain English for Term Structure Bias
+        if   tsb >=  2: _tsb_b, _tsb_s, _tsb_c = "BULLISH", "Strong",   GREEN
+        elif tsb ==  1: _tsb_b, _tsb_s, _tsb_c = "BULLISH", "Mild",     "#69F0AE"
+        elif tsb <= -2: _tsb_b, _tsb_s, _tsb_c = "BEARISH", "Strong",   RED
+        elif tsb == -1: _tsb_b, _tsb_s, _tsb_c = "BEARISH", "Mild",     "#FF6D00"
+        else:           _tsb_b, _tsb_s, _tsb_c = "SIDEWAYS","—",        MUTED
         st.markdown(f"""
         <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
             <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Term Structure Bias</div>
-            <div style="font-size:20px;font-weight:700;color:{GREEN if tsb>0 else (RED if tsb<0 else MUTED)};">{tsb:+d}</div>
+            <div style="font-size:20px;font-weight:700;color:{_tsb_c};">{tsb:+d}</div>
             <div class="explain-text">−2 to +2: steepening contango = +2, steep backwardation = −2</div>
+            <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_tsb_b, _tsb_s, _tsb_c)}
+                <span style="color:{TEXT};">+2 = strong contango (bullish carry); −2 = steep backwardation (supply squeeze).</span>
+            </div>
         </div>""", unsafe_allow_html=True)
 
 # ── FOOTER ────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(f"""
 <div style="text-align:center;font-size:10px;color:{MUTED};padding:10px;">
-    Commodities Options Analysis Dashboard v4.0 · Streamlit Edition<br>
+    Shantanu's Commodity Analysis Dashboard v4.0 · Streamlit Edition<br>
     Data: {'Dhan API (MCX)' if CFG.USE_DHAN else 'DEMO MODE'} · 
     Auto-refresh: {AUTO_REFRESH_SECONDS}s · 
     History ticks: {sum(len(v) for v in st.session_state['history'].values() if isinstance(v,list))}
