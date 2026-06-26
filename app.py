@@ -1225,6 +1225,11 @@ df_band  = m.pop("df_band", df)
 # Spot fallback: if option chain returned last_price=0, use roll near_ltp
 # Roll fetched AFTER option chain to avoid Dhan rate-limit on the main OC call
 roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
+# v4-fix: when Dhan returns empty roll (market closed / no data), fall back to demo
+_roll_is_demo = False
+if not roll and CFG.USE_DHAN:
+    roll = demo_futures_roll(symbol)
+    _roll_is_demo = True
 if spot == 0 and roll and roll.get("near_ltp", 0) > 0:
     spot = roll["near_ltp"]
     m    = compute_metrics(df, spot, symbol, expiry=exp)   # recompute with corrected spot
@@ -1455,6 +1460,8 @@ for col, (lbl, val, c, tip) in zip(level_cols, level_items):
 st.markdown("---")
 st.markdown("### 📦 Futures Roll Analysis & Intraday OI Curve")
 if roll:
+    if _roll_is_demo:
+        st.caption("⚠ **Demo roll data** — live Dhan feed returned no prices (market likely closed). Roll metrics use simulated values.")
     # ── Contract cards: Near / Next / Far ─────────────────────────────
     _has_far = roll.get("has_far") and roll.get("far_ltp", 0) > 0
     _ncols   = 3 if _has_far else 2
