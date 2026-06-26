@@ -59,12 +59,10 @@ ATM_BAND             = 20
 AUTO_REFRESH_SECONDS = 60
 
 DHAN_SECURITY = {
-    "GOLD":    {"id": 114, "seg": "MCX_COMM", "step": 100},
     "GOLDM":   {"id": 117, "seg": "MCX_COMM", "step": 100},
-    "SILVER":  {"id": 115, "seg": "MCX_COMM", "step": 1000},
     "SILVERM": {"id": 122, "seg": "MCX_COMM", "step": 1000},
 }
-COMMODITY_SYMBOLS = ["GOLD", "GOLDM", "SILVER", "SILVERM"]
+COMMODITY_SYMBOLS = ["GOLDM", "SILVERM"]
 
 # ─────────────────────────────────────────────────────────────────────
 #  AUTO-DETECT MONTHLY SCRIP IDs  (near / next / far — auto-refreshed daily)
@@ -85,10 +83,16 @@ def get_dynamic_futures_ids():
         df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX_COMM') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
         id_map = {}
         for sym in COMMODITY_SYMBOLS:
-            if sym == "GOLD":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLD\d')]
+            # GOLDM must match "GOLDM" prefix (not "GOLD"); SILVERM must match "SILVERM" (not "SILVER")
+            # Use word-boundary-style regex so GOLD doesn't match GOLDM contracts etc.
+            if sym == "GOLDM":
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLDM')]
+            elif sym == "SILVERM":
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVERM')]
+            elif sym == "GOLD":
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLD(?!M)')]
             elif sym == "SILVER":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVER\d')]
+                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVER(?!M)')]
             else:
                 df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.startswith(sym)]
             df_sym = df_sym.dropna(subset=['SEM_EXPIRY_CODE']).sort_values('SEM_EXPIRY_CODE')
@@ -274,7 +278,7 @@ def _solve_iv(mkt_price, S, K, T, r, opt):
 # ─────────────────────────────────────────────────────────────────────
 def fetch_dhan_expiry_list(symbol: str = "GOLD"):
     """Auto-detects all future expiry dates for the selected commodity."""
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])
+    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
     headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
     try:
         resp     = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
@@ -293,7 +297,7 @@ def fetch_dhan_option_chain(symbol: str = "GOLD", expiry: str = None):
     """
     if not CFG.USE_DHAN:
         return pd.DataFrame(), 0.0, ""
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])
+    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
     headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
     if expiry is None:
         try:
@@ -366,7 +370,7 @@ def fetch_futures_roll(symbol: str = "GOLD") -> dict:
     """
     if not CFG.USE_DHAN:
         return {}
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])
+    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
     headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
 
     try:
@@ -385,29 +389,70 @@ def fetch_futures_roll(symbol: str = "GOLD") -> dict:
         print(f"[Roll] Expiry list error: {e}")
         return {}
 
-    def _fetch_chain(expiry):
-        try:
-            r    = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
-                                 json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry}, timeout=20)
-            data = r.json().get("data", {})
-            ltp  = float(data.get("last_price", 0) or 0)
-            oc   = data.get("oc", {})
-            call_oi  = sum(int((v.get("ce") or {}).get("oi", 0) or 0) for v in oc.values())
-            put_oi   = sum(int((v.get("pe") or {}).get("oi", 0) or 0) for v in oc.values())
-            call_vol = sum(int((v.get("ce") or {}).get("volume", 0) or 0) for v in oc.values())
-            put_vol  = sum(int((v.get("pe") or {}).get("volume", 0) or 0) for v in oc.values())
-            return ltp, call_oi + put_oi, call_vol + put_vol
-        except Exception as e:
-            print(f"[Roll] Chain fetch error for {expiry}: {e}")
-            return 0.0, 0, 0
+    # ── Step 1: get per-contract futures LTPs via the marketfeed/ltp endpoint ──
+    # The option-chain last_price always returns the near-month underlying price
+    # regardless of which expiry you query — useless for spread calculation.
+    # The LTP endpoint returns a different price per security ID (per contract month).
+    fut_ids = get_dynamic_futures_ids().get(symbol, [])
+    near_id = fut_ids[0] if len(fut_ids) >= 1 else None
+    next_id = fut_ids[1] if len(fut_ids) >= 2 else None
+    far_id  = fut_ids[2] if len(fut_ids) >= 3 else None
 
-    near_ltp, near_oi, near_vol = _fetch_chain(near_expiry)
-    next_ltp, next_oi, next_vol = _fetch_chain(next_expiry)
-    far_ltp,  far_oi,  far_vol  = _fetch_chain(far_expiry) if far_expiry else (0.0, 0, 0)
+    near_ltp = next_ltp = far_ltp = 0.0
+
+    if near_id:
+        ids_to_fetch = [i for i in [near_id, next_id, far_id] if i is not None]
+        try:
+            ltp_resp = requests.post(
+                "https://api.dhan.co/v2/marketfeed/ltp",
+                headers=headers,
+                json={"MCX_COMM": ids_to_fetch},
+                timeout=10,
+            )
+            ltp_data = ltp_resp.json().get("data", {}).get("MCX_COMM", {})
+            # Keys are security IDs as strings
+            near_ltp = float((ltp_data.get(str(near_id)) or {}).get("last_price", 0) or 0)
+            next_ltp = float((ltp_data.get(str(next_id)) or {}).get("last_price", 0) or 0) if next_id else 0.0
+            far_ltp  = float((ltp_data.get(str(far_id))  or {}).get("last_price", 0) or 0) if far_id  else 0.0
+            print(f"[Roll/{symbol}] LTP endpoint: near={near_ltp} next={next_ltp} far={far_ltp}")
+        except Exception as e:
+            print(f"[Roll/{symbol}] LTP endpoint failed: {e}")
+
+    # Fallback: if LTP endpoint returns zero (market closed / IDs not found in master CSV),
+    # use the option chain last_price for near only
+    if near_ltp == 0:
+        try:
+            oc_resp  = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
+                                     json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+                                           "Expiry": near_expiry}, timeout=20)
+            near_ltp = float(oc_resp.json().get("data", {}).get("last_price", 0) or 0)
+            print(f"[Roll/{symbol}] Fallback option-chain LTP: near={near_ltp}")
+        except Exception as e:
+            print(f"[Roll/{symbol}] Fallback option-chain failed: {e}")
 
     if near_ltp == 0:
-        print(f"[Roll] near_ltp=0 for {symbol} — market may be closed")
+        print(f"[Roll] near_ltp=0 for {symbol} — market may be closed or IDs missing")
         return {}
+
+    # ── Step 2: get options OI per expiry as a positioning proxy ──
+    def _fetch_oi(expiry):
+        try:
+            r   = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
+                                json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+                                      "Expiry": expiry}, timeout=20)
+            oc  = r.json().get("data", {}).get("oc", {})
+            oi  = sum(int((v.get("ce") or {}).get("oi", 0) or 0) +
+                      int((v.get("pe") or {}).get("oi", 0) or 0) for v in oc.values())
+            vol = sum(int((v.get("ce") or {}).get("volume", 0) or 0) +
+                      int((v.get("pe") or {}).get("volume", 0) or 0) for v in oc.values())
+            return oi, vol
+        except Exception as e:
+            print(f"[Roll] OI fetch error for {expiry}: {e}")
+            return 0, 0
+
+    near_oi, near_vol = _fetch_oi(near_expiry)
+    next_oi, next_vol = _fetch_oi(next_expiry)
+    far_oi,  far_vol  = _fetch_oi(far_expiry) if far_expiry else (0, 0)
 
     total_oi        = near_oi + next_oi
     roll_spread     = round(next_ltp - near_ltp, 2)
@@ -484,14 +529,13 @@ def fetch_futures_roll(symbol: str = "GOLD") -> dict:
 # ─────────────────────────────────────────────────────────────────────
 #  DEMO MODE
 # ─────────────────────────────────────────────────────────────────────
-def fetch_demo_option_chain(symbol: str = "GOLD"):
+def fetch_demo_option_chain(symbol: str = "GOLDM"):
     np.random.seed(int(time.time()) // 60)
+    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
     if "GOLD" in symbol:
         spot = 93500.0 + np.random.normal(0, 150)
-        step = DHAN_SECURITY[symbol]["step"]
     else:
         spot = 96500.0 + np.random.normal(0, 300)
-        step = DHAN_SECURITY[symbol]["step"]
     atm     = round(spot / step) * step
     strikes = np.arange(atm - 25 * step, atm + 26 * step, step)
     T = 10 / 365.0; r = RISK_FREE_RATE
@@ -524,7 +568,7 @@ def fetch_demo_option_chain(symbol: str = "GOLD"):
     expiry = (date.today() + timedelta(days=10)).strftime("%Y-%m-%d")
     return pd.DataFrame(rows), round(spot, 2), expiry
 
-def demo_futures_roll(symbol: str = "GOLD") -> dict:
+def demo_futures_roll(symbol: str = "GOLDM") -> dict:
     """Generates realistic demo futures roll data for all 3 months."""
     near_ltp = (93500.0 if "GOLD" in symbol else 96500.0) + np.random.normal(0, 80)
     spread1  = abs(np.random.normal(120, 40))
@@ -579,7 +623,7 @@ def compute_wing_excess(df_band, atm, atm_iv, symbol="GOLD"):
     Plain English: tells you if traders are paying extra to hedge against
     sharp drops (put skew) or sharp rises (call skew).
     """
-    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
     otm_put_iv = df_band.loc[
         df_band["strike"].between(atm - 6*step, atm - 2*step) & (df_band["put_iv"] > 0.5), "put_iv"
     ]
@@ -638,7 +682,7 @@ def classify_iv_smile_scenario(df_band, m, spot, symbol="GOLD", iv_smile_history
     if df_band is None or (hasattr(df_band, 'empty') and df_band.empty):
         return None
     df   = df_band.copy()
-    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
     atm     = safe_num(m.get("atm", spot))
     atm_iv  = safe_num(m.get("atm_iv", 0))
     iv_rank = safe_num(m.get("iv_rank", 50))
@@ -875,7 +919,7 @@ def compute_rollover_velocity_zscore(oi_history: dict, symbol: str):
 #  METRICS ENGINE
 # ─────────────────────────────────────────────────────────────────────
 def select_atm_band(df, spot, symbol="GOLD"):
-    step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+    step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
     strikes = sorted(df["strike"].unique())
     atm     = min(strikes, key=lambda x: abs(x - spot))
     lo, hi  = atm - ATM_BAND * step, atm + ATM_BAND * step
@@ -950,7 +994,7 @@ def compute_metrics(df, spot, symbol="GOLD", expiry=None, roll=None):
 
     df_band, atm = select_atm_band(df, spot, symbol)
     df_band      = _fill_missing_greeks(df_band, spot, expiry)
-    step         = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+    step         = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
 
     df_band["intr_c"] = np.maximum(0, spot - df_band["strike"])
     df_band["ev_c"]   = np.maximum(0, df_band["call_ltp"] - df_band["intr_c"])
@@ -1082,7 +1126,7 @@ def compute_score(m, roll=None):
 
 def strategy_recommendation(score, m, symbol="GOLD"):
     support    = m.get("support", 0); resistance = m.get("resistance", 0)
-    atm        = m.get("atm", 0);     step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+    atm        = m.get("atm", 0);     step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
     if score >= 85:   name, color = "Long Call / Bull Call Spread", "#00C853"
     elif score >= 70: name, color = "Bull Call Spread",             "#69F0AE"
     elif score >= 55: name, color = "Bull Put Spread (High Prob)",  "#B2FF59"
@@ -1645,7 +1689,7 @@ score = compute_score(m, roll)
 strat = strategy_recommendation(score, m, symbol)
 
 # ── Gamma Regime ──────────────────────────────────────────────────────
-step   = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLD"])["step"]
+step   = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
 g_regime, g_regime_desc, vol_regime, g_regime_color = classify_gamma_regime(
     m.get("gex", 0), m.get("wall_width", 0), m.get("momentum", 0),
     atm_iv, m.get("iv_rank", 50), spot, m.get("gamma_flip"), step)
