@@ -215,7 +215,11 @@ def _solve_iv(mkt, S, K, T, r, opt):
 
 # ─────────────────────────────────────────────────────────────────────
 #  DHAN FETCHERS
+#  Cache option chain calls for 55s (just under the 60s refresh cycle).
+#  This ensures the roll's _fetch_oi calls for near-expiry hit the cache
+#  rather than making a live API call, keeping total Dhan API calls ≤ 3.
 # ─────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=55, show_spinner=False)
 def fetch_dhan_expiry_list(symbol="GOLDM"):
     sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
     headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
@@ -227,6 +231,7 @@ def fetch_dhan_expiry_list(symbol="GOLDM"):
         return [e for e in expiries if e >= today]
     except Exception as e: print(f"[Dhan] Expiry list error: {e}"); return []
 
+@st.cache_data(ttl=55, show_spinner=False)
 def fetch_dhan_option_chain(symbol="GOLDM", expiry=None):
     if not CFG.USE_DHAN: return pd.DataFrame(), 0.0, ""
     sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
@@ -513,57 +518,34 @@ def compute_max_pain(df):
 
 def _fill_missing_greeks(df_band, spot, expiry=None):
     """
-    PER-STRIKE filling — fixes the original all-or-nothing bug.
-    Dhan MCX returns greeks only for liquid ATM strikes; illiquid OTM strikes
-    get delta=gamma=0 from API.  The old condition `.max() > 1e-9` caused an
-    early return the moment ANY strike had a non-zero gamma, leaving all the
-    illiquid strikes unfilled — causing jagged IV smile & broken GEX/delta charts.
-    Now we check each row individually and fill wherever greeks or IV are zero.
+    Exact port of the original app-5.py implementation.
+    Only fills greeks when the API returned ALL-zero gammas (common with MCX).
+    Does NOT overwrite IV — preserves Dhan's implied_volatility as-is.
+    The key lesson: the per-strike delta==0 trigger was wrong — deep OTM options
+    legitimately have delta=0.0000 (truncated by Dhan), and overwriting their IV
+    with 15% corrupted the IV smile.
     """
     if df_band.empty: return df_band
+    # Return unchanged if Dhan DID provide gammas (any non-zero = API has greeks)
+    if df_band["call_gamma"].abs().max() > 1e-9 and df_band["put_gamma"].abs().max() > 1e-9:
+        return df_band
     try:
         T = max((datetime.strptime(expiry[:10],"%Y-%m-%d").date() - date.today()).days, 1)/365.0 if expiry else 10/365.0
     except Exception: T = 10/365.0
     r   = RISK_FREE_RATE
     df2 = df_band.copy()
     for idx, row in df2.iterrows():
-        K = float(row["strike"])
-        # ── CALL ──────────────────────────────────────────────────────
-        c_needs_fill = (abs(float(row.get("call_gamma",0) or 0)) < 1e-9 or
-                        abs(float(row.get("call_delta",0) or 0)) < 1e-9)
-        if c_needs_fill:
-            iv_c = float(row.get("call_iv", 0) or 0) / 100.0
-            # Try BS-solve from LTP if IV is missing
-            if iv_c < 0.01:
-                ltp_c = float(row.get("call_ltp", 0) or 0)
-                if ltp_c > 0.05:
-                    iv_c = _solve_iv(ltp_c, spot, K, T, r, "CE") or 0.0
-            iv_c = iv_c if iv_c > 0.01 else 0.15
-            cd, cg, ct, cv = _bs_greeks(spot, K, T, r, iv_c, "CE")
-            df2.at[idx, "call_delta"] = cd
-            df2.at[idx, "call_gamma"] = cg
-            df2.at[idx, "call_theta"] = ct
-            df2.at[idx, "call_vega"]  = cv
-            # Fill IV display value if API returned 0
-            if float(df2.at[idx, "call_iv"]) < 0.5:
-                df2.at[idx, "call_iv"] = round(iv_c * 100, 2)
-        # ── PUT ───────────────────────────────────────────────────────
-        p_needs_fill = (abs(float(row.get("put_gamma", 0) or 0)) < 1e-9 or
-                        abs(float(row.get("put_delta", 0) or 0)) < 1e-9)
-        if p_needs_fill:
-            iv_p = float(row.get("put_iv", 0) or 0) / 100.0
-            if iv_p < 0.01:
-                ltp_p = float(row.get("put_ltp", 0) or 0)
-                if ltp_p > 0.05:
-                    iv_p = _solve_iv(ltp_p, spot, K, T, r, "PE") or 0.0
-            iv_p = iv_p if iv_p > 0.01 else 0.15
-            pd2, pg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
-            df2.at[idx, "put_delta"] = pd2
-            df2.at[idx, "put_gamma"] = pg
-            df2.at[idx, "put_theta"] = pt
-            df2.at[idx, "put_vega"]  = pv
-            if float(df2.at[idx, "put_iv"]) < 0.5:
-                df2.at[idx, "put_iv"] = round(iv_p * 100, 2)
+        K    = float(row["strike"])
+        iv_c = float(row.get("call_iv", 0) or 0) / 100.0
+        iv_p = float(row.get("put_iv",  0) or 0) / 100.0
+        iv_c = iv_c if iv_c > 0.01 else 0.15
+        iv_p = iv_p if iv_p > 0.01 else 0.15
+        cd, cg, ct, cv  = _bs_greeks(spot, K, T, r, iv_c, "CE")
+        pd2, pg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
+        df2.at[idx, "call_delta"] = cd; df2.at[idx, "call_gamma"] = cg
+        df2.at[idx, "call_theta"] = ct; df2.at[idx, "call_vega"]  = cv
+        df2.at[idx, "put_delta"]  = pd2; df2.at[idx, "put_gamma"] = pg
+        df2.at[idx, "put_theta"]  = pt;  df2.at[idx, "put_vega"]  = pv
     return df2
 
 def compute_gamma_flip(df_band, spot):
@@ -1180,20 +1162,27 @@ if refresh_clicked:
     st.session_state["last_refresh"] = time.time(); st.rerun()
 
 # ── FETCH DATA ────────────────────────────────────────────────────────
-# Fetch roll FIRST so near_ltp is available as spot fallback when OC returns spot=0
-roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
-
+# IMPORTANT: option chain FIRST (matches original app order).
+# Fetching roll before the option chain adds 5 extra API calls — Dhan MCX
+# rate-limits quickly and the 7th call (main option chain) returns partial data,
+# causing jagged/wrong charts. Roll is fetched AFTER the main chain just like
+# the original app-5.py.
 df, spot, exp, source = get_option_chain(symbol, expiry if expiry else None)
 if df.empty:
     st.error("No data available. Check API credentials or try again."); st.stop()
 
-# Spot fallback — MCX option chain often returns last_price=0
-if spot == 0 and roll and roll.get("near_ltp", 0) > 0:
-    spot = roll["near_ltp"]
-
 m        = compute_metrics(df, spot, symbol, expiry=exp)
 atm_iv   = m.get("atm_iv", 0)
 df_band  = m.pop("df_band", df)
+
+# Spot fallback: if option chain returned last_price=0, use roll near_ltp
+# Roll fetched AFTER option chain to avoid Dhan rate-limit on the main OC call
+roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
+if spot == 0 and roll and roll.get("near_ltp", 0) > 0:
+    spot = roll["near_ltp"]
+    m    = compute_metrics(df, spot, symbol, expiry=exp)   # recompute with corrected spot
+    atm_iv  = m.get("atm_iv", 0)
+    df_band = m.pop("df_band", df)
 
 # v4 computations
 put_wing_excess, call_wing_excess = compute_wing_excess(df_band, m.get("atm",0), atm_iv, symbol)
