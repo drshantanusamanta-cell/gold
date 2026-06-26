@@ -57,7 +57,7 @@ def get_dynamic_futures_ids():
         resp = requests.get(url, timeout=15); resp.raise_for_status()
         df   = pd.read_csv(io.StringIO(resp.text))
         df.columns = [c.upper() for c in df.columns]
-        df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX_COMM') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
+        df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
         id_map = {}
         for sym in COMMODITY_SYMBOLS:
             if sym == "GOLDM":
@@ -89,7 +89,7 @@ def get_futures_contracts():
         resp = requests.get(url, timeout=15); resp.raise_for_status()
         df   = pd.read_csv(io.StringIO(resp.text))
         df.columns = [c.upper() for c in df.columns]
-        df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX_COMM') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
+        df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
         today   = date.today().isoformat()
         result  = {}
 
@@ -97,6 +97,7 @@ def get_futures_contracts():
             raw = str(raw or '').strip()
             try:
                 if len(raw) == 10 and raw[4] == '-':   return raw              # YYYY-MM-DD
+                if len(raw) >= 10 and raw[4] == '-':   return raw[:10]            # YYYY-MM-DD HH:MM:SS
                 if len(raw) == 8  and raw.isdigit():   return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
                 return datetime.strptime(raw, "%d-%b-%Y").strftime("%Y-%m-%d")
             except Exception: return raw
@@ -365,14 +366,33 @@ def fetch_futures_roll(symbol="GOLDM") -> dict:
     try:
         qr = requests.post("https://api.dhan.co/v2/marketfeed/quote", headers=headers,
                            json={"MCX_COMM": ids_to_fetch}, timeout=12)
-        qd = qr.json().get("data", {}).get("MCX_COMM", {})
+        resp_json = qr.json()
+        raw_data  = resp_json.get("data", {})
+        print(f"[Roll/Quote/{symbol}] status={resp_json.get('status','')} data_type={type(raw_data).__name__} keys={list(raw_data.keys())[:5] if isinstance(raw_data,dict) else 'N/A'}")
+
+        # Build a unified lookup dict keyed by security ID string
+        _quotes = {}
+        if isinstance(raw_data, dict):
+            # Expected: {"MCX_COMM": {"510764": {"ltp": ..., "openInterest": ...}}}
+            segment_data = raw_data.get("MCX_COMM", raw_data)
+            if isinstance(segment_data, dict):
+                _quotes = {str(k): v for k, v in segment_data.items() if v and isinstance(v, dict)}
+            # If segment_data is a list, handle array format
+            elif isinstance(segment_data, list):
+                for item in segment_data:
+                    sid = str(item.get("symbolId", item.get("securityId", item.get("id", ""))))
+                    if sid: _quotes[sid] = item
+        elif isinstance(raw_data, list):
+            for item in raw_data:
+                sid = str(item.get("symbolId", item.get("securityId", item.get("id", ""))))
+                if sid: _quotes[sid] = item
 
         def _q(sid):
             if sid is None: return 0.0, 0, 0
-            d   = qd.get(str(sid), {}) or {}
-            ltp = float(d.get("last_price", d.get("lastTradedPrice", d.get("ltp", 0))) or 0)
-            oi  = int(d.get("oi", d.get("open_interest", d.get("openInterest", d.get("netOI", 0)))) or 0)
-            vol = int(d.get("volume", d.get("totalVolume", d.get("total_volume", 0))) or 0)
+            d   = _quotes.get(str(sid), {}) or {}
+            ltp = float(d.get("ltp", d.get("lastPrice", d.get("last_price", d.get("lastTradedPrice", 0)))) or 0)
+            oi  = int(d.get("openInterest", d.get("oi", d.get("open_interest", d.get("netOI", 0)))) or 0)
+            vol = int(d.get("totalVolume", d.get("volume", d.get("total_volume", 0)))) or 0
             return ltp, oi, vol
 
         near_ltp, near_oi, near_vol = _q(near_id)
