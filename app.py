@@ -512,19 +512,58 @@ def compute_max_pain(df):
     return min(results, key=results.get) if results else 0.0
 
 def _fill_missing_greeks(df_band, spot, expiry=None):
+    """
+    PER-STRIKE filling — fixes the original all-or-nothing bug.
+    Dhan MCX returns greeks only for liquid ATM strikes; illiquid OTM strikes
+    get delta=gamma=0 from API.  The old condition `.max() > 1e-9` caused an
+    early return the moment ANY strike had a non-zero gamma, leaving all the
+    illiquid strikes unfilled — causing jagged IV smile & broken GEX/delta charts.
+    Now we check each row individually and fill wherever greeks or IV are zero.
+    """
     if df_band.empty: return df_band
-    if df_band["call_gamma"].abs().max() > 1e-9 and df_band["put_gamma"].abs().max() > 1e-9: return df_band
     try:
         T = max((datetime.strptime(expiry[:10],"%Y-%m-%d").date() - date.today()).days, 1)/365.0 if expiry else 10/365.0
     except Exception: T = 10/365.0
+    r   = RISK_FREE_RATE
     df2 = df_band.copy()
     for idx, row in df2.iterrows():
         K = float(row["strike"])
-        ic = max(float(row.get("call_iv",0) or 0)/100, 0.15)
-        ip = max(float(row.get("put_iv", 0) or 0)/100, 0.15)
-        _, cg, _, _ = _bs_greeks(spot,K,T,RISK_FREE_RATE,ic,"CE")
-        _, pg, _, _ = _bs_greeks(spot,K,T,RISK_FREE_RATE,ip,"PE")
-        df2.at[idx,"call_gamma"] = cg; df2.at[idx,"put_gamma"] = pg
+        # ── CALL ──────────────────────────────────────────────────────
+        c_needs_fill = (abs(float(row.get("call_gamma",0) or 0)) < 1e-9 or
+                        abs(float(row.get("call_delta",0) or 0)) < 1e-9)
+        if c_needs_fill:
+            iv_c = float(row.get("call_iv", 0) or 0) / 100.0
+            # Try BS-solve from LTP if IV is missing
+            if iv_c < 0.01:
+                ltp_c = float(row.get("call_ltp", 0) or 0)
+                if ltp_c > 0.05:
+                    iv_c = _solve_iv(ltp_c, spot, K, T, r, "CE") or 0.0
+            iv_c = iv_c if iv_c > 0.01 else 0.15
+            cd, cg, ct, cv = _bs_greeks(spot, K, T, r, iv_c, "CE")
+            df2.at[idx, "call_delta"] = cd
+            df2.at[idx, "call_gamma"] = cg
+            df2.at[idx, "call_theta"] = ct
+            df2.at[idx, "call_vega"]  = cv
+            # Fill IV display value if API returned 0
+            if float(df2.at[idx, "call_iv"]) < 0.5:
+                df2.at[idx, "call_iv"] = round(iv_c * 100, 2)
+        # ── PUT ───────────────────────────────────────────────────────
+        p_needs_fill = (abs(float(row.get("put_gamma", 0) or 0)) < 1e-9 or
+                        abs(float(row.get("put_delta", 0) or 0)) < 1e-9)
+        if p_needs_fill:
+            iv_p = float(row.get("put_iv", 0) or 0) / 100.0
+            if iv_p < 0.01:
+                ltp_p = float(row.get("put_ltp", 0) or 0)
+                if ltp_p > 0.05:
+                    iv_p = _solve_iv(ltp_p, spot, K, T, r, "PE") or 0.0
+            iv_p = iv_p if iv_p > 0.01 else 0.15
+            pd2, pg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
+            df2.at[idx, "put_delta"] = pd2
+            df2.at[idx, "put_gamma"] = pg
+            df2.at[idx, "put_theta"] = pt
+            df2.at[idx, "put_vega"]  = pv
+            if float(df2.at[idx, "put_iv"]) < 0.5:
+                df2.at[idx, "put_iv"] = round(iv_p * 100, 2)
     return df2
 
 def compute_gamma_flip(df_band, spot):
@@ -1320,12 +1359,24 @@ with chart_cols2[0]:
                                     legend=dict(orientation="h",y=1.08,x=0)))
     st.plotly_chart(f4, use_container_width=True, config={"displayModeBar":False})
 with chart_cols2[1]:
+    # IV Smile — filter to liquid strikes (OI > 0) to avoid zero-IV zigzag
+    iv_df = df_band[df_band["call_oi"] + df_band["put_oi"] > 0].copy()
+    # Smooth noisy API IVs with a 3-point rolling average for display
+    iv_df = iv_df.sort_values("strike")
+    civ_smooth = iv_df["call_iv"].rolling(3, center=True, min_periods=1).mean()
+    piv_smooth = iv_df["put_iv"].rolling(3, center=True, min_periods=1).mean()
     f5 = go.Figure([
-        go.Scatter(x=df_band["strike"],y=df_band["call_iv"],mode="lines+markers",name="Call IV",line=dict(color=GOLD)),
-        go.Scatter(x=df_band["strike"],y=df_band["put_iv"], mode="lines+markers",name="Put IV", line=dict(color=SILVER)),
+        go.Scatter(x=iv_df["strike"], y=civ_smooth, mode="lines+markers", name="Call IV (smoothed)",
+                   line=dict(color=GOLD, width=2), marker=dict(size=5)),
+        go.Scatter(x=iv_df["strike"], y=piv_smooth, mode="lines+markers", name="Put IV (smoothed)",
+                   line=dict(color=SILVER, width=2), marker=dict(size=5)),
+        go.Scatter(x=iv_df["strike"], y=iv_df["call_iv"], mode="markers", name="Call IV (raw)",
+                   marker=dict(color=GOLD, size=4, opacity=0.35, symbol="circle-open")),
+        go.Scatter(x=iv_df["strike"], y=iv_df["put_iv"],  mode="markers", name="Put IV (raw)",
+                   marker=dict(color=SILVER, size=4, opacity=0.35, symbol="circle-open")),
     ])
     _vline(f5,spot,AMBER,"Spot")
-    f5.update_layout(**chart_layout(title="IV Smile",yaxis_title="IV %",
+    f5.update_layout(**chart_layout(title="IV Smile (liquid strikes, 3pt smoothed)",yaxis_title="IV %",
                                     legend=dict(orientation="h",y=1.08,x=0)))
     st.plotly_chart(f5, use_container_width=True, config={"displayModeBar":False})
 
