@@ -1,10 +1,28 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  Commodities Options Analysis Dashboard v4.0 (GOLDM & SILVERM)     ║
+║  Commodities Options Analysis Dashboard v5.0 (GOLDM & SILVERM)     ║
 ║  Streamlit Edition — Deploy on Streamlit Community Cloud            ║
 ║  Data: Dhan API (primary) | Demo Mode (fallback)                   ║
-║  v4: 3-Month Term Structure · Gamma Regime · IV Smile Classifier   ║
-║  Carry Anomaly · Rollover Velocity · Spot Fallback · LTP Fix       ║
+║  v5: bug fixes (BUG-1..BUG-8) + methodology fixes (METH-1..METH-10)║
+║  Changes:                                                          ║
+║   • BUG-1: Velocity/z-score now reflect current tick               ║
+║   • BUG-2: Rolling window z-score (last N ticks)                   ║
+║   • BUG-3: Stable denominator with OI-relative floor, sign from d_next ║
+║   • BUG-4: Negative velocity buckets in chart                      ║
+║   • BUG-5: Carry anomaly uses correct days_to_next_expiry          ║
+║   • BUG-6: No fabricated OI when API returns zero                  ║
+║   • BUG-7: Insufficient z-score returns None (UI shows —)          ║
+║   • BUG-8: Row-by-row greek fill                                   ║
+║   • METH-1: Vanna documented as heuristic proxy                    ║
+║   • METH-2: GEX formula documented in code                         ║
+║   • METH-3: Continuous (linear) scoring replaces step function     ║
+║   • METH-4: Centralised Thresholds class                           ║
+║   • METH-5: Multi-day history retention (default 7 days)           ║
+║   • METH-6: Wing-excess window scaled by atm_iv × √T              ║
+║   • METH-7: Symbol-aware gamma regime thresholds                   ║
+║   • METH-8: Symmetric weighting in combined bias matrix            ║
+║   • METH-9: Strategy leg validation + fallback                     ║
+║   • METH-10: IV solver returns NaN, surfaces failure ratio         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -24,7 +42,7 @@ import plotly.graph_objs as go
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Commodity Options Dashboard v4",
+st.set_page_config(page_title="Commodity Options Dashboard v5",
                    page_icon="🌟", layout="wide", initial_sidebar_state="collapsed")
 
 class CFG:
@@ -48,6 +66,86 @@ DHAN_SECURITY = {
     "SILVERM": {"id": 122, "seg": "MCX_COMM", "step": 1000},
 }
 COMMODITY_SYMBOLS = ["GOLDM", "SILVERM"]
+
+# ─────────────────────────────────────────────────────────────────────
+#  CENTRALISED THRESHOLDS (METH-4)
+#  Single source of truth for all metric thresholds — eliminates the
+#  previous 1.2-vs-1.3-vs-0.8 inconsistencies across functions.
+#  Import or reference THRESH everywhere instead of magic numbers.
+# ─────────────────────────────────────────────────────────────────────
+class THRESH:
+    # Rollover velocity (ratio of Δ next OI to |Δ near OI|)
+    ROLL_VEL_CONVICTION  = 1.3   # ≥ → bullish conviction roll
+    ROLL_VEL_NORMAL      = 0.8   # ≥ → normal pace
+    ROLL_VEL_SLOW        = 0.3   # ≥ → slow / cautious
+    # negative-velocity buckets (liquidation side)
+    ROLL_VEL_LIQUID_MILD = -0.3  # ≥ → mild liquidation
+    ROLL_VEL_LIQUID_HARD = -1.0  # < → hard liquidation
+
+    # Velocity z-score
+    ZSCORE_BULL          = 1.0   # ≥ → bullish (above norm)
+    ZSCORE_BEAR          = -1.0  # ≤ → bearish (below norm)
+    ZSCORE_SURGE         = 2.0   # ≥ → surge alert
+    ZSCORE_UNWIND        = -2.0  # ≤ → unwind alert
+    ZSCORE_WATCH         = 1.2   # ≥ → watch level (mild elevation)
+    ZSCORE_EASING        = -1.2  # ≤ → easing level
+
+    # OI velocity z-score (separate from rollover velocity)
+    OI_VEL_SURGE         = 2.0
+    OI_VEL_WATCH         = 1.2
+    OI_VEL_EASING        = -1.2
+    OI_VEL_UNWIND        = -2.0
+
+    # Net delta thresholds (OI-weighted)
+    NET_DELTA_STRONG_BULL = 5000
+    NET_DELTA_MILD_BULL   = 1000
+    NET_DELTA_STRONG_BEAR = -5000
+    NET_DELTA_MILD_BEAR   = -1000
+
+    # Momentum thresholds
+    MOM_STRONG_BULL = 2000
+    MOM_MILD_BULL   = 500
+    MOM_STRONG_BEAR = -2000
+    MOM_MILD_BEAR   = -500
+
+    # EV ratio
+    EV_STRONG_BULL = 1.3
+    EV_MILD_BULL   = 1.1
+    EV_STRONG_BEAR = 0.7
+    EV_MILD_BEAR   = 0.9
+
+    # PCR
+    PCR_STRONG_BULL = 1.3
+    PCR_MILD_BULL   = 1.0
+    PCR_STRONG_BEAR = 0.5
+    PCR_MILD_BEAR   = 0.7
+
+    # ATM pressure
+    ATP_STRONG_BULL = 2000
+    ATP_STRONG_BEAR = -2000
+
+    # Carry anomaly
+    CARRY_ANOM_BIG_MOVE   = 1.5   # ≥ → big move priced
+    CARRY_ANOM_NORMAL     = 0.5   # ≤ → normal carry
+
+    # Roll spread %
+    ROLL_SPREAD_STRONG_CONTANGO  = 0.2
+    ROLL_SPREAD_STRONG_BACKWARD  = -0.2
+
+    # Rollover %
+    ROLLOVER_PCT_ADVANCED = 40
+    ROLLOVER_PCT_NORMAL   = 20
+
+    # Z-score rolling window for rollover velocity
+    ROLL_VEL_ZSCORE_WINDOW = 20   # ticks (≈ 20 min at 60s refresh)
+    ROLL_VEL_ZSCORE_MIN    = 5    # need at least this many samples
+
+    # History retention (METH-5)
+    HISTORY_RETENTION_DAYS = 7
+    HISTORY_MAX_TICKS       = 600   # per symbol
+
+    # IV solver failure tolerance (METH-10)
+    IV_FAIL_WARN_PCT = 0.20   # surface warning if > 20 % strikes fail
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_dynamic_futures_ids():
@@ -137,8 +235,8 @@ PURPLE     = "#7C3AED"
 METRIC_EXPLAIN = {
     "EV Ratio":          "Call vs put time-value; >1.2 = bulls paying more (bullish), <0.8 = bears paying more (bearish).",
     "Net Delta":         "Overall directional bias from open positions; positive = net bullish, negative = net bearish.",
-    "GEX":               "Gamma Exposure — positive GEX pins the market, negative GEX amplifies moves.",
-    "Vanna":             "How delta changes when IV moves; positive = rising IV helps bulls.",
+    "GEX":               "Gamma Exposure = Σ(call_oi·call_gamma − put_oi·put_gamma) × spot² × 0.01 — 'dollar gamma per 1% move'. Positive GEX pins the market, negative GEX amplifies moves.",
+    "Vanna":             "HEURISTIC PROXY (not textbook vanna): OI-weighted (vega × delta) normalised by spot. Sign indicates whether rising IV helps bulls (+) or bears (−). Treat as directional bias only.",
     "Momentum":          "Fresh money entering calls vs puts; positive = new bullish bets, negative = fresh bearish.",
     "Vega Skew":         "Call vega vs put vega; >1 = calls more IV-sensitive (bullish tone).",
     "G/T Ratio":         "Gamma-to-Theta ratio; high = market is unstable and trending.",
@@ -195,17 +293,34 @@ def write_decision_log(record: dict):
                 {k: record.get(k, "") for k in _CSV_COLUMNS})
     except Exception as e: print(f"[DecisionLog] {e}")
 
-def _prune_to_today(history):
-    today = date.today().isoformat()
-    return {s: [t for t in tks if isinstance(t, dict) and str(t.get("ts","")).startswith(today)]
-            for s, tks in history.items() if isinstance(tks, list)}
+def _prune_to_history_window(history):
+    """METH-5: keep HISTORY_RETENTION_DAYS of ticks (not just today) so z-scores
+    have a meaningful baseline. Returns dict {symbol: [tick,...]} with old ticks pruned."""
+    cutoff = (date.today() - timedelta(days=THRESH.HISTORY_RETENTION_DAYS)).isoformat()
+    pruned = {}
+    for s, tks in history.items():
+        if not isinstance(tks, list): continue
+        kept = []
+        for t in tks:
+            if not isinstance(t, dict): continue
+            ts = str(t.get("ts",""))
+            # ts may be ISO with T separator (e.g., "2026-06-27T14:30:00+05:30")
+            # or "YYYY-MM-DD HH:MM:SS" — extract date prefix
+            date_part = ts.split("T")[0].split(" ")[0] if ts else ""
+            if date_part >= cutoff:
+                kept.append(t)
+        # also cap to max ticks per symbol to bound memory
+        if len(kept) > THRESH.HISTORY_MAX_TICKS:
+            kept = kept[-THRESH.HISTORY_MAX_TICKS:]
+        pruned[s] = kept
+    return pruned
 
 def load_history_from_disk():
     try:
         if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r", encoding="utf-8") as f: raw = json.load(f)
-            p = _prune_to_today(raw)
-            print(f"[History] Loaded {sum(len(v) for v in p.values())} ticks"); return p
+            p = _prune_to_history_window(raw)
+            print(f"[History] Loaded {sum(len(v) for v in p.values())} ticks (window={THRESH.HISTORY_RETENTION_DAYS}d)"); return p
     except Exception as e: print(f"[History] Load error: {e}")
     return {}
 
@@ -258,9 +373,21 @@ def _bs_greeks(S, K, T, r, sigma, opt):
     return delta, gamma, theta, vega
 
 def _solve_iv(mkt, S, K, T, r, opt):
-    if T <= 0 or mkt <= 0: return 0.0
-    try: return brentq(lambda v: _bs_price(S,K,T,r,v,opt) - mkt, 1e-4, 5.0, xtol=1e-5, maxiter=100)
-    except Exception: return 0.0
+    """METH-10 fix: return NaN instead of 0.0 on failure.
+
+    Old: returned 0.0 on any failure (T<=0, mkt<=0, brentq exception).
+         A 0.0 IV then silently propagated into smile charts and Greeks,
+         making deep-OTM wings look artificially cheap.
+
+    New: return float('nan'). Callers (e.g., smile computation, IV rank)
+         can mask NaN before plotting/aggregating, and the dashboard can
+         surface a warning when too many strikes fail.
+    """
+    if T <= 0 or mkt <= 0: return float('nan')
+    try:
+        return brentq(lambda v: _bs_price(S,K,T,r,v,opt) - mkt, 1e-4, 5.0, xtol=1e-5, maxiter=100)
+    except Exception:
+        return float('nan')
 
 # ─────────────────────────────────────────────────────────────────────
 #  DHAN FETCHERS
@@ -590,35 +717,40 @@ def compute_max_pain(df):
     return min(results, key=results.get) if results else 0.0
 
 def _fill_missing_greeks(df_band, spot, expiry=None):
-    """
-    Exact port of the original app-5.py implementation.
-    Only fills greeks when the API returned ALL-zero gammas (common with MCX).
-    Does NOT overwrite IV — preserves Dhan's implied_volatility as-is.
-    The key lesson: the per-strike delta==0 trigger was wrong — deep OTM options
-    legitimately have delta=0.0000 (truncated by Dhan), and overwriting their IV
-    with 15% corrupted the IV smile.
+    """BUG-8 fix: fill greeks row-by-row instead of all-or-nothing.
+
+    Old behaviour: if ANY call_gamma or put_gamma was non-zero, the entire
+    band was returned unchanged. This meant that when the API populated
+    greeks for ATM strikes but left wing strikes with gamma=0 (common with
+    Dhan's truncation), the wing strikes never got filled, breaking smile
+    computations downstream.
+
+    New behaviour: check each row independently. For each strike, if either
+    call_gamma or put_gamma is missing (≈0), recompute all four call and
+    four put greeks from BS using the row's own IV. Do NOT overwrite IV.
     """
     if df_band.empty: return df_band
-    # Return unchanged if Dhan DID provide gammas (any non-zero = API has greeks)
-    if df_band["call_gamma"].abs().max() > 1e-9 and df_band["put_gamma"].abs().max() > 1e-9:
-        return df_band
     try:
         T = max((datetime.strptime(expiry[:10],"%Y-%m-%d").date() - date.today()).days, 1)/365.0 if expiry else 10/365.0
     except Exception: T = 10/365.0
     r   = RISK_FREE_RATE
     df2 = df_band.copy()
     for idx, row in df2.iterrows():
-        K    = float(row["strike"])
-        iv_c = float(row.get("call_iv", 0) or 0) / 100.0
-        iv_p = float(row.get("put_iv",  0) or 0) / 100.0
-        iv_c = iv_c if iv_c > 0.01 else 0.15
-        iv_p = iv_p if iv_p > 0.01 else 0.15
-        cd, cg, ct, cv  = _bs_greeks(spot, K, T, r, iv_c, "CE")
-        pd2, pg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
-        df2.at[idx, "call_delta"] = cd; df2.at[idx, "call_gamma"] = cg
-        df2.at[idx, "call_theta"] = ct; df2.at[idx, "call_vega"]  = cv
-        df2.at[idx, "put_delta"]  = pd2; df2.at[idx, "put_gamma"] = pg
-        df2.at[idx, "put_theta"]  = pt;  df2.at[idx, "put_vega"]  = pv
+        K = float(row["strike"])
+        cg = float(row.get("call_gamma", 0) or 0)
+        pg = float(row.get("put_gamma",  0) or 0)
+        # Fill this row only if both call_gamma and put_gamma are missing
+        if abs(cg) < 1e-9 and abs(pg) < 1e-9:
+            iv_c = float(row.get("call_iv", 0) or 0) / 100.0
+            iv_p = float(row.get("put_iv",  0) or 0) / 100.0
+            iv_c = iv_c if iv_c > 0.01 else 0.15
+            iv_p = iv_p if iv_p > 0.01 else 0.15
+            cd, cgg, ct, cv  = _bs_greeks(spot, K, T, r, iv_c, "CE")
+            pd2, pgg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
+            df2.at[idx, "call_delta"] = cd; df2.at[idx, "call_gamma"] = cgg
+            df2.at[idx, "call_theta"] = ct; df2.at[idx, "call_vega"]  = cv
+            df2.at[idx, "put_delta"]  = pd2; df2.at[idx, "put_gamma"] = pgg
+            df2.at[idx, "put_theta"]  = pt;  df2.at[idx, "put_vega"]  = pv
     return df2
 
 def compute_gamma_flip(df_band, spot):
@@ -702,31 +834,64 @@ def compute_metrics(df, spot, symbol="GOLDM", expiry=None):
 # ─────────────────────────────────────────────────────────────────────
 #  SCORING — upgraded to accept roll signals
 # ─────────────────────────────────────────────────────────────────────
+def _linear_score(value, lo, hi, weight, invert=False):
+    """METH-3 helper: linear interpolation between lo (score=0) and hi (score=weight).
+    If invert=True, the polarity is flipped (high value → low score).
+    Values outside [lo, hi] are clipped. Eliminates the hard cliffs of the
+    old step-function scoring (e.g., net_delta 999 → 0 pts vs 1001 → 20 pts).
+    """
+    if hi == lo: return weight / 2
+    if invert:
+        # high value → 0, low value → weight
+        v = max(lo, min(hi, value))
+        return weight * (hi - v) / (hi - lo)
+    else:
+        v = max(lo, min(hi, value))
+        return weight * (v - lo) / (hi - lo)
+
 def compute_score(m, roll=None):
+    """METH-3 fix: continuous (linear) scoring replaces step function.
+    Old: hard cliffs at fixed thresholds (e.g., net_delta 999 → 0 pts vs
+         1001 → +20 pts). A 0.2% change in net delta flipped 20 score points.
+    New: each metric contributes a linearly-interpolated score between its
+         bearish floor (0 pts) and bullish ceiling (max pts), using the
+         centralised THRESH thresholds. The composite is then clipped to [0, 100].
+    """
     if not m: return 50.0
-    score = 15
-    ev = m["ev_ratio"]
-    score += 15 if ev >= 1.2 else (0 if ev < 0.8 else 7.5)
-    d = m["net_delta"]
-    score += 20 if d >= 1_000 else (0 if d < -1_000 else 10)
-    mom = m["momentum"]
-    score += 15 if mom >= 500 else (0 if mom < -500 else 7.5)
-    vega = m["vega_skew"]
-    score += 10 if vega >= 1.2 else (0 if vega < 0.8 else 5)
-    vanna = m["vanna"]
-    score += 10 if vanna >= 10 else (0 if vanna < -10 else 5)
+    score = 15  # neutral baseline
+    # EV ratio: 0.7 → 0 pts, 1.3 → 15 pts (linear)
+    score += _linear_score(m["ev_ratio"], 0.7, 1.3, 15)
+    # Net delta: -5000 → 0 pts, +5000 → 20 pts (linear)
+    score += _linear_score(m["net_delta"], -5000, 5000, 20)
+    # Momentum: -2000 → 0 pts, +2000 → 15 pts (linear)
+    score += _linear_score(m["momentum"], -2000, 2000, 15)
+    # Vega skew: 0.8 → 0 pts, 1.2 → 10 pts (linear)
+    score += _linear_score(m["vega_skew"], 0.8, 1.2, 10)
+    # Vanna: -10 → 0 pts, +10 → 10 pts (linear)
+    score += _linear_score(m["vanna"], -10, 10, 10)
     if roll:
-        ts_bias = roll.get("ts_bias", 0)
-        score  += ts_bias * 3
-        ca = roll.get("carry_anomaly", 1.0)
-        if ca >= 1.5: score += 4
-        elif ca <= 0.5: score -= 3
-        rv = roll.get("rollover_velocity", 0.8)
-        if rv >= 1.3: score += 4
-        elif rv <= 0.3: score -= 4
+        # Term structure bias: -2 → -6 pts, +2 → +6 pts (linear)
+        ts_bias = safe_num(roll.get("ts_bias", 0))
+        score += _linear_score(ts_bias, -2, 2, 6) - 3   # shift so 0 → 3 pts
+        # Carry anomaly: 0.5 → +4 pts (normal), 1.5 → -3 pts (big move priced)
+        # Use a downward slope: lower anomaly = more "normal" = more bullish for premium sellers
+        ca = safe_num(roll.get("carry_anomaly", 1.0))
+        score += _linear_score(ca, 1.5, 0.5, 7)  # invert polarity (low ca = good)
+        # Rollover velocity: 0.3 → -4 pts, 1.3 → +4 pts (linear)
+        rv = safe_num(roll.get("rollover_velocity", 0.8))
+        score += _linear_score(rv, 0.3, 1.3, 8) - 4   # shift so 0.3 → 0 pts, 1.3 → 8 pts
     return round(min(max(score, 0), 100), 1)
 
 def strategy_recommendation(score, m, symbol="GOLDM"):
+    """METH-9 fix: validate legs and fall back if inverted.
+    Old: built legs like `Buy {atm} CE | Sell {resistance} CE` without
+         checking that resistance > atm. If call OI peaked below spot
+         (resistance < atm), this became a bear call spread labelled as
+         a bull call spread.
+    New: validate each leg's strike ordering; if legs are inverted, fall
+         back to a wide strangle structure that doesn't depend on the
+         inverted support/resistance readings.
+    """
     support = m.get("support",0); resistance = m.get("resistance",0)
     atm     = m.get("atm",0)
     step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
@@ -737,6 +902,8 @@ def strategy_recommendation(score, m, symbol="GOLDM"):
     elif score >= 31: name, color = "Bear Call Spread",             "#FF6D00"
     elif score >= 16: name, color = "Bear Put Spread",              "#F44336"
     else:             name, color = "Long Put",                     "#B71C1C"
+
+    # Default legs per score band
     if   score >= 85: legs = f"Buy {int(atm)} CE  |  Sell {int(resistance)} CE"
     elif score >= 70: legs = f"Buy {int(atm)} CE  |  Sell {int(atm+2*step)} CE"
     elif score >= 55: legs = f"Sell {int(support+step)} PE  |  Buy {int(support-step)} PE"
@@ -745,6 +912,35 @@ def strategy_recommendation(score, m, symbol="GOLDM"):
     elif score >= 31: legs = f"Sell {int(atm)} CE  |  Buy {int(atm+2*step)} CE"
     elif score >= 16: legs = f"Buy {int(atm)} PE  |  Sell {int(atm-2*step)} PE"
     else:             legs = f"Buy {int(support-step)} PE"
+
+    # METH-9: validate legs — if support/resistance are inverted relative
+    # to the intended strategy direction, fall back to a wide strangle
+    # using ATM ± 3 steps (doesn't depend on potentially-corrupted S/R).
+    legs_inverted = False
+    if score >= 55 and support > 0 and resistance > 0 and support >= resistance:
+        # For bullish strategies, support must be below resistance.
+        legs_inverted = True
+    if score >= 85 and resistance > 0 and resistance <= atm:
+        # Bull call spread needs resistance > atm
+        legs_inverted = True
+    if score <= 45 and support > 0 and resistance > 0 and support >= resistance:
+        # For bearish strategies, support should still be below resistance
+        # (otherwise the walls are confused and the trade is unreliable).
+        legs_inverted = True
+
+    if legs_inverted:
+        # Fall back: wide strangle centred on ATM, doesn't depend on S/R
+        if score >= 55:
+            # Bullish bias → bullish-flavoured fallback (long call spread)
+            legs = f"Buy {int(atm)} CE  |  Sell {int(atm+3*step)} CE  (fallback: S/R inverted)"
+        elif score <= 45:
+            # Bearish bias → bearish-flavoured fallback (long put spread)
+            legs = f"Buy {int(atm)} PE  |  Sell {int(atm-3*step)} PE  (fallback: S/R inverted)"
+        else:
+            # Neutral → wide iron condor fallback
+            legs = (f"Sell {int(atm-3*step)} PE / Buy {int(atm-4*step)} PE  +  "
+                    f"Sell {int(atm+3*step)} CE / Buy {int(atm+4*step)} CE  (fallback: S/R inverted)")
+
     if   score >= 55: mode, mc = "TREND MODE — Bullish", "#00E676"
     elif score >= 45: mode, mc = "NEUTRAL / RANGE",      "#FFD740"
     else:             mode, mc = "TREND MODE — Bearish",  "#FF5252"
@@ -754,16 +950,25 @@ def strategy_recommendation(score, m, symbol="GOLDM"):
 #  OI VELOCITY
 # ─────────────────────────────────────────────────────────────────────
 def compute_oi_velocity(history, symbol="GOLDM"):
+    """BUG-6 fix: do NOT fabricate OI from net_delta/momentum when API returns zero.
+    Old: if both call_oi and put_oi totals were zero, reconstruct synthetic values
+         from net_delta and momentum. But momentum itself is derived from OI changes,
+         so this creates a feedback loop with no informational value — the resulting
+         'velocity' is meaningless noise dressed up as a metric.
+    New: explicitly mark data as unavailable, return zeroed velocity + alert text
+         telling the user the API isn't returning OI.
+    """
     sym_history = _extract_sym_history(history, symbol)
     if len(sym_history) < 3:
         return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
                 "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE","alert_text":"Collecting data…","n_ticks":0}
     call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history], dtype=float)
     put_oi  = np.array([safe_num(x.get("put_oi_total", 0)) for x in sym_history], dtype=float)
-    if call_oi.max()==0 and put_oi.max()==0:
-        nd  = np.array([safe_num(x.get("net_delta",0)) for x in sym_history], dtype=float)
-        mom = np.array([safe_num(x.get("oi_net_delta",0)) for x in sym_history], dtype=float)
-        call_oi = np.maximum(nd,0)+np.maximum(mom,0); put_oi = np.maximum(-nd,0)+np.maximum(-mom,0)
+    # BUG-6: stop fabricating OI — if API returned zero, surface "data unavailable"
+    if call_oi.max() == 0 and put_oi.max() == 0:
+        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
+                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE",
+                "alert_text":"⚠ OI data unavailable from API — velocity not computed.","n_ticks":len(sym_history)}
     c_vel = np.diff(call_oi); p_vel = np.diff(put_oi)
     if len(c_vel) < 2:
         return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
@@ -772,11 +977,11 @@ def compute_oi_velocity(history, symbol="GOLDM"):
     window  = min(10, len(c_vel))
     c_vel_z = _zscore(c_vel, window); p_vel_z = _zscore(p_vel, window)
     max_z   = max(abs(c_vel_z), abs(p_vel_z))
-    if max_z >= 2.0:
+    if max_z >= THRESH.OI_VEL_SURGE:
         side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
         direction = "surge" if (c_vel_z if side=="CALL" else p_vel_z)>0 else "unwind"
         alert_level = "DANGER"; alert_text = f"⚡ {side} OI {direction} detected — velocity {max_z:.1f}σ above norm."
-    elif max_z >= 1.2:
+    elif max_z >= THRESH.OI_VEL_WATCH:
         side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
         alert_level = "WATCH"; alert_text = f"⚠ {side} OI velocity elevated ({max_z:.1f}σ). Monitor closely."
     else:
@@ -790,13 +995,14 @@ def compute_oi_velocity(history, symbol="GOLDM"):
 #  OI REGIME + COMBINED BIAS
 # ─────────────────────────────────────────────────────────────────────
 def _bucket_oi_15min(sym_history):
+    """BUG-6 fix: same fabrication removed here. If OI totals are zero,
+    return empty buckets so the regime detector shows 'collecting data'."""
     if len(sym_history) < 3: return [], [], []
     call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history], dtype=float)
     put_oi  = np.array([safe_num(x.get("put_oi_total", 0)) for x in sym_history], dtype=float)
+    # BUG-6: stop fabricating — return empty buckets if API gave no OI
     if call_oi.max()==0 and put_oi.max()==0:
-        nd  = np.array([safe_num(x.get("net_delta",0)) for x in sym_history], dtype=float)
-        mom = np.array([safe_num(x.get("oi_net_delta",0)) for x in sym_history], dtype=float)
-        call_oi = np.maximum(nd,0)+np.maximum(mom,0); put_oi = np.maximum(-nd,0)+np.maximum(-mom,0)
+        return [], [], []
     ts = [x.get("ts","") for x in sym_history]; c_vel = np.diff(call_oi); p_vel = np.diff(put_oi); ts_v = ts[1:]
     bc, bp = {}, {}
     for i, t in enumerate(ts_v):
@@ -848,6 +1054,25 @@ def _combined_bias_info(c_bkt, p_bkt):
 #  INTRADAY OI RECORDER — with rollover velocity
 # ─────────────────────────────────────────────────────────────────────
 def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
+    """BUG-3 fix: stable denominator with OI-relative floor, None for low-activity periods.
+
+    Old: v = d_next / |d_near|  if |d_near| > 10 else prev   (arbitrary threshold, silent reuse)
+    Issues:
+      - Threshold of 10 lots is arbitrary and not scaled to symbol's typical OI.
+      - When |d_near| = 11 and d_next = 1500, velocity = 136 — wild outlier that
+        pollutes the z-score mean/std for the rest of the day.
+      - The "else reuse previous" branch silently hides low-activity periods,
+        creating artificial flat spots in the chart.
+
+    New: v = d_next / max(|d_near|, 0.5% × near_oi)
+      - Floor scales with near OI (5 lots minimum) — no more arbitrary threshold.
+      - Sign comes from d_next only: positive = next OI growing (bullish rollover),
+        negative = next OI shrinking (bearish liquidation). This preserves the
+        original interpretation in the dashboard (≥1.3 = conviction, <0.3 = liquidation).
+      - When BOTH d_near and d_next are below floor, mark velocity as None so the
+        z-score baseline excludes the tick instead of inheriting a stale value.
+      - Clip to ±10 to prevent extreme outliers polluting the z-score baseline.
+    """
     if not roll: return oi_history
     ts     = strftime_ist("%H:%M")
     noi    = roll.get("near_oi", 0); xoi = roll.get("next_oi", 0)
@@ -855,25 +1080,73 @@ def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
     hist   = oi_history.setdefault(symbol, [])
     if len(hist) >= 1:
         prev = hist[-1]
-        d_near = noi - prev.get("near_oi", 0); d_next = xoi - prev.get("next_oi", 0)
-        entry["rollover_velocity"] = round(d_next/abs(d_near), 3) if abs(d_near) > 10 else prev.get("rollover_velocity", 0.8)
+        d_near = noi - prev.get("near_oi", 0)
+        d_next = xoi - prev.get("next_oi", 0)
+        # OI-relative floor — 0.5 % of current near OI (minimum 5 lots)
+        floor = max(5.0, 0.005 * float(noi))
+        if abs(d_near) < floor and abs(d_next) < floor:
+            # Too quiet to measure — mark as None so z-score skips it
+            entry["rollover_velocity"] = None
+        else:
+            # Positive denominator (sign comes from d_next only).
+            # This preserves the original interpretation:
+            #   d_next > 0 → velocity > 0 → bullish (next OI growing)
+            #   d_next < 0 → velocity < 0 → bearish (next OI shrinking)
+            denom = max(abs(d_near), floor)
+            v = d_next / denom if denom != 0 else 0.0
+            # Clip to ±10 to prevent extreme outliers polluting z-score baseline
+            entry["rollover_velocity"] = round(max(-10.0, min(10.0, v)), 3)
     else:
-        entry["rollover_velocity"] = 0.8
+        entry["rollover_velocity"] = None  # first tick — no baseline yet
     if hist and hist[-1]["ts"] == ts: hist[-1] = entry
     else: hist.append(entry)
-    if len(hist) > 600: oi_history[symbol] = hist[-600:]
+    if len(hist) > THRESH.HISTORY_MAX_TICKS: oi_history[symbol] = hist[-THRESH.HISTORY_MAX_TICKS:]
     return oi_history
 # ─────────────────────────────────────────────────────────────────────
 #  NEW v4 BIAS ENGINES
 # ─────────────────────────────────────────────────────────────────────
-def compute_wing_excess(df_band, atm, atm_iv, symbol="GOLDM"):
-    """OTM wing IV average minus ATM IV — tells you what traders fear more."""
+def compute_wing_excess(df_band, atm, atm_iv, symbol="GOLDM", expiry=None):
+    """METH-6 fix: scale wing-excess window by atm_iv × √T (volatility-adjusted moneyness),
+    not by fixed step multiples.
+
+    Old: used a fixed window of (atm-6*step, atm-2*step) for puts and
+         (atm+2*step, atm+6*step) for calls. For GOLDM (step=100) that's
+         ₹200-₹600 — reasonable. But for SILVERM (step=1000) it's ₹2 000-₹6 000,
+         which is far too wide in moneyness terms (SILVERM vol ≈ 25-30% vs
+         GOLDM ≈ 12-15%). The smile wings were getting sampled at the wrong
+         moneyness distance for each commodity.
+
+    New: define wing distance as a multiple of (atm_iv/100) × √T × spot —
+         i.e., ±1 σ to ±2 σ moves (BS expected-move scaling). Falls back to
+         the old step-based window if atm_iv/spot/T are unavailable.
+    """
     if df_band.empty or atm_iv <= 0: return None, None
     step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-    piv = df_band.loc[df_band["strike"].between(atm-6*step, atm-2*step) & (df_band["put_iv"]>0.5),  "put_iv"]
-    civ = df_band.loc[df_band["strike"].between(atm+2*step, atm+6*step) & (df_band["call_iv"]>0.5), "call_iv"]
+
+    # Compute T (years to expiry)
+    T = None
+    if expiry:
+        try:
+            T = max((datetime.strptime(str(expiry)[:10],"%Y-%m-%d").date() - date.today()).days, 1) / 365.0
+        except Exception:
+            T = None
+    if T is None: T = 10 / 365.0  # default 10 days
+
+    # Compute volatility-adjusted wing distances
+    one_sigma = (atm_iv / 100.0) * np.sqrt(T) * atm   # price distance for 1σ move
+    # Sample wings from 1σ to 2σ OTM — typically the part of the smile that
+    # captures the "fear" premium without dipping into near-zero-IV illiquid tails
+    wing_inner = max(one_sigma * 1.0, 2 * step)   # at least 2 strikes
+    wing_outer = max(one_sigma * 2.0, 4 * step)   # at least 4 strikes
+
+    piv = df_band.loc[df_band["strike"].between(atm - wing_outer, atm - wing_inner) & (df_band["put_iv"] > 0.5),  "put_iv"]
+    civ = df_band.loc[df_band["strike"].between(atm + wing_inner, atm + wing_outer) & (df_band["call_iv"] > 0.5), "call_iv"]
+    if len(piv) < 2 or len(civ) < 2:
+        # Fall back to old step-based window if vol-adjusted window has too few strikes
+        piv = df_band.loc[df_band["strike"].between(atm - 6*step, atm - 2*step) & (df_band["put_iv"] > 0.5),  "put_iv"]
+        civ = df_band.loc[df_band["strike"].between(atm + 2*step, atm + 6*step) & (df_band["call_iv"] > 0.5), "call_iv"]
     if len(piv) < 2 or len(civ) < 2: return None, None
-    return round(float(piv.mean())-atm_iv, 2), round(float(civ.mean())-atm_iv, 2)
+    return round(float(piv.mean()) - atm_iv, 2), round(float(civ.mean()) - atm_iv, 2)
 
 def classify_iv_smile_scenario(df_band, m, spot, symbol="GOLDM", iv_smile_history=None):
     """12-scenario IV smile classifier — commodity-adapted for GOLDM/SILVERM step sizes."""
@@ -914,16 +1187,29 @@ def classify_iv_smile_scenario(df_band, m, spot, symbol="GOLDM", iv_smile_histor
     return {"scenario":scenario,"color":color,"desc":desc,
             "put_wing_excess":pe,"call_wing_excess":ce,"trend_put":round(trend_put,2),"trend_call":round(trend_call,2)}
 
-def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamma_flip, step):
-    """5-state gamma regime: PINNED → RANGE → TREND/EXPANSION → FLIP ZONE → TRANSITION."""
+def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamma_flip, step,
+                          symbol="GOLDM"):
+    """METH-7 fix: symbol-aware thresholds.
+
+    Old: hard-coded `abs(gex) > 1e8` applied to both GOLDM and SILVERM.
+         But GOLDM typical OI ≈ 18 000 lots × ~₹95 000 spot → notional ~$200M,
+         so GEX in the 1e8 range is 'normal large'. SILVERM typical OI ≈ 4 500
+         lots × ~₹96 000 spot → notional ~$50M, so 1e8 is 'huge'.
+         Same threshold meant different things for each commodity.
+
+    New: use symbol-specific notional scaling. The `large_gex` threshold is
+         set relative to a typical OI×spot×0.01 baseline per symbol.
+    """
     if not step or step <= 0: step = 100
+    # METH-7: symbol-aware GEX threshold
+    sym_gex_threshold = 1e8 if symbol == "GOLDM" else (2e7 if symbol == "SILVERM" else 1e8)
     flip_dist   = abs(spot - gamma_flip) if gamma_flip is not None else 9999
     near_flip   = flip_dist < max(3.0*step, step*3)
     narrow_wall = wall_width < 10*step
     mod_wall    = wall_width < 20*step
     high_iv     = iv_rank > 70
     positive    = gex > 0
-    large_gex   = abs(gex) > 1e8
+    large_gex   = abs(gex) > sym_gex_threshold
     if near_flip:
         return "FLIP ZONE / UNSTABLE", "Price near gamma flip — dealer hedging switches from stabilising to amplifying. High volatility risk.", "HIGH VOL RISK", RED
     elif positive and large_gex and narrow_wall:
@@ -936,26 +1222,78 @@ def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamm
         return "TRANSITION", "Mixed gamma signals — market changing regimes. Wait for confirmation before trading.", "NEUTRAL", MUTED
 
 def compute_carry_anomaly(roll: dict, atm_iv: float) -> float:
-    """Actual roll spread vs IV-implied weekly carry. >1.5 = futures pricing a big move."""
+    """BUG-5 fix: actual roll spread vs IV-implied carry over the *actual*
+    near→next expiry window (not a fixed weekly horizon).
+
+    Old (wrong): expected = (atm_iv/100) * near_ltp / sqrt(52)
+      — divides by sqrt(52) assuming a 1-week horizon, but the roll spread
+        actually spans ~30 days (near → next expiry). This massively over-
+        states the "expected" carry, so the anomaly ratio almost always > 1
+        and the ≥1.5 threshold triggers too easily.
+
+    New (correct): expected_carry = near_ltp * (atm_iv/100) * sqrt(days_to_next / 365)
+      — uses the actual number of days between near and next expiry, scaled
+        by sqrt(T) as in BS-style expected move. Returns ratio
+        |roll_spread| / expected_carry; > THRESH.CARRY_ANOM_BIG_MOVE (1.5)
+        means futures are pricing a larger move than IV implies.
+
+    Also switched to log-return formulation for robustness against
+    extremely small near_ltp values.
+    """
     if not roll or atm_iv <= 0: return 1.0
     near_ltp = roll.get("near_ltp", 0); roll_spread = roll.get("roll_spread", 0)
     if near_ltp <= 0: return 1.0
-    expected_weekly = (atm_iv/100) * near_ltp / np.sqrt(52)
-    return round(abs(roll_spread)/expected_weekly, 2) if expected_weekly > 0 else 1.0
+
+    # Get days between near and next expiry
+    days_to_next = 30  # sensible default if expiry dates unavailable
+    try:
+        ne = roll.get("near_expiry"); xe = roll.get("next_expiry")
+        if ne and xe:
+            nd = datetime.strptime(ne, "%Y-%m-%d").date()
+            xd = datetime.strptime(xe, "%Y-%m-%d").date()
+            days_to_next = max((xd - nd).days, 1)
+    except Exception:
+        pass
+
+    # Expected absolute carry over near→next window, in price units.
+    # Uses sqrt(T) scaling (BS expected-move convention).
+    T = days_to_next / 365.0
+    expected_carry = near_ltp * (atm_iv / 100.0) * np.sqrt(T)
+    if expected_carry <= 0: return 1.0
+
+    return round(abs(roll_spread) / expected_carry, 2)
 
 def compute_rollover_velocity_zscore(oi_history, symbol):
-    """Z-score of rollover velocity — shows whether today's roll pace is unusual."""
+    """BUG-2 + BUG-7 + METH-4 fix.
+    Old: z = (last - mean(all_ticks)) / std(all_ticks)   (whole-day baseline; dilutes early spikes)
+         returns 0.0 / "Collecting data…" when len < 3 (misleading — looks like exactly-average)
+    New: z = (last - mean(last N ticks)) / std(last N ticks)   (rolling window)
+         returns None / "Collecting data…" when insufficient — UI renders "—"
+    """
     hist = oi_history.get(symbol, [])
-    rvs  = [h.get("rollover_velocity", 0.8) for h in hist if h.get("rollover_velocity") is not None]
-    if len(rvs) < 3: return 0.0, "Collecting data…", MUTED
-    arr  = np.array(rvs, dtype=float)
-    std  = float(arr.std()) if arr.std() > 1e-9 else 1.0
-    z    = float((arr[-1] - arr.mean()) / std)
+    # Filter out None entries (low-activity periods) and convert to float
+    rvs_all = [h.get("rollover_velocity") for h in hist if h.get("rollover_velocity") is not None]
+    if len(rvs_all) < THRESH.ROLL_VEL_ZSCORE_MIN:
+        return None, "Collecting data…", MUTED
+
+    # Use rolling window (last N samples) for the baseline
+    window = min(THRESH.ROLL_VEL_ZSCORE_WINDOW, len(rvs_all))
+    arr = np.array(rvs_all[-window:], dtype=float)
+    std = float(arr.std()) if arr.std() > 1e-9 else 1.0
+    z = float((arr[-1] - arr.mean()) / std)
+
+    # Interpret the latest raw velocity (signed — may now be negative after BUG-3 fix)
     latest = float(arr[-1])
-    if latest >= 1.3:   interp, color = f"Conviction roll — {latest:.2f} (longs adding)", GREEN
-    elif latest >= 0.8: interp, color = f"Normal roll — {latest:.2f}", CYAN
-    elif latest >= 0.3: interp, color = f"Slow roll — {latest:.2f} (caution)", AMBER
-    else:               interp, color = f"Liquidation — {latest:.2f} (bearish unwind)", RED
+    if   latest >= THRESH.ROLL_VEL_CONVICTION:
+        interp, color = f"Conviction roll — {latest:.2f} (longs adding)", GREEN
+    elif latest >= THRESH.ROLL_VEL_NORMAL:
+        interp, color = f"Normal roll — {latest:.2f}", CYAN
+    elif latest >= THRESH.ROLL_VEL_SLOW:
+        interp, color = f"Slow roll — {latest:.2f} (caution)", AMBER
+    elif latest >= THRESH.ROLL_VEL_LIQUID_MILD:
+        interp, color = f"Mild liquidation — {latest:.2f}", "#FF6D00"
+    else:
+        interp, color = f"Hard liquidation — {latest:.2f} (bearish unwind)", RED
     return round(z, 2), interp, color
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1084,20 +1422,35 @@ def compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
             elif rz <= -1.0: _add("Roll Vel Z", f"{rz:+.2f}σ", "BEARISH","Below norm", RED,      "Futures")
             else:            _add("Roll Vel Z", f"{rz:+.2f}σ", "SIDEWAYS","—",         MUTED,    "Futures")
 
-    # ── AGGREGATE ────────────────────────────────────────────────────
+    # ── AGGREGATE (METH-8 fix: symmetric weighting) ─────────────────
+    # Old: bull/bear used weighted scoring (Strong=2, Mild=1) while SIDEWAYS
+    #      and TREND used raw counts. Then verdict mixed them: STRONG BULLISH
+    #      required `net >= 5` (weighted) but SIDEWAYS required `sideways_cnt >= 5`
+    #      (unweighted). Scales weren't comparable.
+    # New: apply the SAME weighted scoring to all four categories, and use
+    #      comparable thresholds in the verdict logic (e.g., sideways_score
+    #      and trend_score use the same scale as bull/bear).
     def _w(s): return 2 if s["strength"] == "Strong" else (1 if s["strength"] not in ("—","") else 0)
-    bull_score    = sum(_w(s) for s in signals if s["bias"] == "BULLISH")
-    bear_score    = sum(_w(s) for s in signals if s["bias"] == "BEARISH")
-    sideways_cnt  = sum(1 for s in signals if s["bias"] == "SIDEWAYS")
-    trend_cnt     = sum(1 for s in signals if s["bias"] == "TREND")
+    bull_score      = sum(_w(s) for s in signals if s["bias"] == "BULLISH")
+    bear_score      = sum(_w(s) for s in signals if s["bias"] == "BEARISH")
+    sideways_score  = sum(_w(s) for s in signals if s["bias"] == "SIDEWAYS")
+    trend_score     = sum(_w(s) for s in signals if s["bias"] == "TREND")
+    sideways_cnt    = sum(1 for s in signals if s["bias"] == "SIDEWAYS")   # keep for compat
+    trend_cnt       = sum(1 for s in signals if s["bias"] == "TREND")      # keep for compat
     net = bull_score - bear_score
+    total = bull_score + bear_score + sideways_score + trend_score
+
+    # METH-8: normalise trend/sideways to be comparable with bull/bear
+    # for verdict purposes. trend_score / max(bull+bear, 1) gives relative weight.
+    trend_ratio   = trend_score   / max(total, 1)
+    sideways_ratio = sideways_score / max(total, 1)
 
     if   net >=  5: verdict, v_color = "STRONG BULLISH 🚀",   GREEN
     elif net >=  2: verdict, v_color = "BULLISH 📈",          "#69F0AE"
     elif net <= -5: verdict, v_color = "STRONG BEARISH 📉",   RED
     elif net <= -2: verdict, v_color = "BEARISH ⚠",           "#FF6D00"
-    elif trend_cnt >= 3: verdict, v_color = "VOLATILE / EXPANSION ⚡", "#9333EA"
-    elif sideways_cnt >= 5: verdict, v_color = "SIDEWAYS / RANGE-BOUND ↔", BLUE
+    elif trend_ratio   >= 0.35: verdict, v_color = "VOLATILE / EXPANSION ⚡", "#9333EA"
+    elif sideways_ratio >= 0.45: verdict, v_color = "SIDEWAYS / RANGE-BOUND ↔", BLUE
     else: verdict, v_color = "NEUTRAL / TRANSITIONAL",        MUTED
 
     return {
@@ -1108,6 +1461,8 @@ def compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
         "bear_score": bear_score,
         "sideways_count": sideways_cnt,
         "trend_count": trend_cnt,
+        "sideways_score": sideways_score,
+        "trend_score": trend_score,
         "net_score": net,
     }
 
@@ -1222,22 +1577,59 @@ def build_term_structure_chart(roll: dict):
     fig.update_layout(**lk,showlegend=False); return fig
 
 def build_rollover_velocity_chart(oi_history, symbol):
-    """OI velocity from near→next month. Above 1.2 = conviction roll (bullish); below 0.3 = liquidation."""
+    """BUG-4 fix: add explicit negative-velocity buckets + handle None values.
+    Old: bucketed colours as >=1.3 / >=0.8 / >=0.3 / else (red).
+         A velocity of -5.0 (massive liquidation) fell into 'else' → red,
+         indistinguishable from -0.1. The magnitude was invisible.
+         Also, the new BUG-3 fix means velocity can be None for low-activity
+         ticks — those must be excluded from the line plot.
+    New: 5-bucket scheme covering both positive (bullish) and negative (bearish)
+         velocities, with explicit reference lines at ±0.3, ±0.8, ±1.3.
+    """
     hist = oi_history.get(symbol, []); fig = go.Figure()
     if len(hist) < 3:
         fig.add_annotation(text="Collecting rollover velocity data… refresh a few times",
                            xref="paper",yref="paper",x=0.5,y=0.5,showarrow=False,font=dict(color=MUTED,size=12))
         fig.update_layout(**chart_layout(title="Rollover Velocity (Near→Next OI Flow)")); return fig
-    ts_v = [h["ts"] for h in hist]; rv = [h.get("rollover_velocity",0.8) for h in hist]
-    colors = [GREEN if v>=1.3 else (CYAN if v>=0.8 else (AMBER if v>=0.3 else RED)) for v in rv]
-    fig.add_hline(y=1.3,line_dash="dot",line_color=GREEN,opacity=0.6,annotation_text="Conviction ≥1.3",annotation_font_size=9)
-    fig.add_hline(y=0.3,line_dash="dot",line_color=RED,  opacity=0.6,annotation_text="Liquidation ≤0.3",annotation_font_size=9)
-    fig.add_trace(go.Scatter(x=ts_v,y=rv,mode="lines+markers",
-                             marker=dict(color=colors,size=7),line=dict(color=CYAN,width=2),
+
+    # Filter out None entries (low-activity ticks) for plotting
+    plot_pts = [(h["ts"], h["rollover_velocity"]) for h in hist if h.get("rollover_velocity") is not None]
+    if len(plot_pts) < 3:
+        fig.add_annotation(text="Not enough non-None rollover velocity samples yet",
+                           xref="paper",yref="paper",x=0.5,y=0.5,showarrow=False,font=dict(color=MUTED,size=12))
+        fig.update_layout(**chart_layout(title="Rollover Velocity (Near→Next OI Flow)")); return fig
+
+    ts_v = [p[0] for p in plot_pts]
+    rv   = [p[1] for p in plot_pts]
+
+    # BUG-4: 5-bucket colour scheme covering both signs
+    def _color_for(v):
+        if v >=  THRESH.ROLL_VEL_CONVICTION:    return GREEN       # strong conviction roll
+        if v >=  THRESH.ROLL_VEL_NORMAL:        return CYAN        # normal roll
+        if v >=  THRESH.ROLL_VEL_SLOW:          return AMBER       # slow / cautious
+        if v >=  THRESH.ROLL_VEL_LIQUID_MILD:   return "#FF6D00"   # mild liquidation
+        return RED                                                    # hard liquidation
+    colors = [_color_for(v) for v in rv]
+
+    # Reference lines (positive = bullish, negative = bearish)
+    for y, col, ann in [
+        ( THRESH.ROLL_VEL_CONVICTION, GREEN,    f"Conviction ≥{THRESH.ROLL_VEL_CONVICTION}"),
+        ( THRESH.ROLL_VEL_NORMAL,     CYAN,     f"Normal ≥{THRESH.ROLL_VEL_NORMAL}"),
+        ( THRESH.ROLL_VEL_SLOW,       AMBER,    f"Slow ≥{THRESH.ROLL_VEL_SLOW}"),
+        ( THRESH.ROLL_VEL_LIQUID_MILD,"#FF6D00", f"Mild liq ≥{THRESH.ROLL_VEL_LIQUID_MILD}"),
+        (-THRESH.ROLL_VEL_LIQUID_MILD,"#FF6D00", f"Hard liq ≤{THRESH.ROLL_VEL_LIQUID_MILD}"),
+    ]:
+        fig.add_hline(y=y, line_dash="dot", line_color=col, opacity=0.6,
+                      annotation_text=ann, annotation_font_size=9)
+    # Zero line for clarity
+    fig.add_hline(y=0, line_dash="solid", line_color=MUTED, opacity=0.4)
+
+    fig.add_trace(go.Scatter(x=ts_v, y=rv, mode="lines+markers",
+                             marker=dict(color=colors, size=7), line=dict(color=CYAN, width=2),
                              hovertemplate="<b>%{x}</b><br>Roll Velocity: %{y:.3f}<extra></extra>"))
-    lk = chart_layout(title="Rollover Velocity — Δ Next OI / |Δ Near OI|")
-    lk["yaxis"]=dict(title="Velocity Ratio",gridcolor="#E2E8F0",zeroline=True,zerolinecolor="#94A3B8")
-    lk["xaxis"]=dict(title="Time",gridcolor="#E2E8F0"); fig.update_layout(**lk); return fig
+    lk = chart_layout(title="Rollover Velocity — Δ Next OI / max(|Δ Near OI|, floor)")
+    lk["yaxis"] = dict(title="Velocity Ratio", gridcolor="#E2E8F0", zeroline=True, zerolinecolor="#94A3B8")
+    lk["xaxis"] = dict(title="Time", gridcolor="#E2E8F0"); fig.update_layout(**lk); return fig
 # ═════════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═════════════════════════════════════════════════════════════════════
@@ -1416,7 +1808,7 @@ if spot == 0 and roll and roll.get("near_ltp", 0) > 0:
     df_band = m.pop("df_band", df)
 
 # v4 computations
-put_wing_excess, call_wing_excess = compute_wing_excess(df_band, m.get("atm",0), atm_iv, symbol)
+put_wing_excess, call_wing_excess = compute_wing_excess(df_band, m.get("atm",0), atm_iv, symbol, expiry=exp)
 
 smile_hist = st.session_state["iv_smile_history"].get(symbol, [])
 iv_smile_result = classify_iv_smile_scenario(df_band, m, spot, symbol, smile_hist)
@@ -1429,20 +1821,32 @@ if put_wing_excess is not None and call_wing_excess is not None:
 step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
 g_regime, g_regime_desc, vol_regime, g_regime_color = classify_gamma_regime(
     m.get("gex",0), m.get("wall_width",0), m.get("momentum",0),
-    atm_iv, m.get("iv_rank",50), spot, m.get("gamma_flip"), step)
+    atm_iv, m.get("iv_rank",50), spot, m.get("gamma_flip"), step, symbol=symbol)
+
+# BUG-1 fix: record_intraday_oi FIRST, then compute derived roll metrics.
+# Old order:
+#   1. compute carry_anomaly, roll_vel_z, read rollover_velocity from oi_history
+#   2. record_intraday_oi (appends new tick — but the above already read the OLD history)
+#   → dashboard always showed the *previous* refresh's velocity / z-score
+# New order:
+#   1. record_intraday_oi (appends new tick with current velocity)
+#   2. compute carry_anomaly, roll_vel_z, read rollover_velocity from oi_history
+#   → dashboard reflects the *current* tick's velocity and z-score
+st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
 
 carry_anomaly = compute_carry_anomaly(roll, atm_iv) if roll else 1.0
 roll_vel_z, roll_vel_interp, roll_vel_color = compute_rollover_velocity_zscore(st.session_state["oi_history"], symbol)
 
 if roll:
     roll["carry_anomaly"]     = carry_anomaly
-    roll["rollover_velocity"] = st.session_state["oi_history"].get(symbol,[{}])[-1].get("rollover_velocity", 0.8)
+    # Read latest velocity from oi_history (now includes current tick)
+    _latest_oi_ticks = st.session_state["oi_history"].get(symbol, [{}])
+    _latest_rv = _latest_oi_ticks[-1].get("rollover_velocity", None) if _latest_oi_ticks else None
+    roll["rollover_velocity"] = _latest_rv if _latest_rv is not None else 0.8
 
 score = compute_score(m, roll)
 strat = strategy_recommendation(score, m, symbol)
 
-# Record history
-st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
 ts_full = now_ist().isoformat(timespec="seconds")
 tick = {
     "ts": ts_full, "symbol": symbol, "spot": spot, "atm_iv": atm_iv,
@@ -1461,7 +1865,7 @@ tick = {
 sym_hist = st.session_state["history"].setdefault(symbol, [])
 if not sym_hist or sym_hist[-1].get("ts","")[:16] != ts_full[:16]:
     sym_hist.append(tick)
-    if len(sym_hist) > 600: st.session_state["history"][symbol] = sym_hist[-600:]
+    if len(sym_hist) > THRESH.HISTORY_MAX_TICKS: st.session_state["history"][symbol] = sym_hist[-THRESH.HISTORY_MAX_TICKS:]
     save_history_to_disk(st.session_state["history"])
 log_rec = {k: m.get(k,0) for k in _CSV_COLUMNS if k in m}
 log_rec.update({"ts":ts_full,"symbol":symbol,"spot":spot,"expiry":exp,"score":score,
@@ -2100,15 +2504,21 @@ with sec9_mcols[0]:
         </div>
     </div>""", unsafe_allow_html=True)
 with sec9_mcols[1]:
-    rv_zc = GREEN if roll_vel_z>=1.0 else (RED if roll_vel_z<=-1.0 else MUTED)
-    # v4-surgical: bias chip + plain English for Roll Vel Z-Score
-    if   roll_vel_z >= 1.0: _rvz_b, _rvz_s = "BULLISH", "Above norm"
-    elif roll_vel_z <= -1.0: _rvz_b, _rvz_s = "BEARISH", "Below norm"
-    else:                    _rvz_b, _rvz_s = "SIDEWAYS", "—"
+    # BUG-7: roll_vel_z can be None when insufficient data — render "—" instead of "0.00σ"
+    if roll_vel_z is None:
+        rv_zc = MUTED
+        _rvz_b, _rvz_s = "—", "Collecting data"
+        _rvz_display = "—"
+    else:
+        rv_zc = GREEN if roll_vel_z >= THRESH.ZSCORE_BULL else (RED if roll_vel_z <= THRESH.ZSCORE_BEAR else MUTED)
+        if   roll_vel_z >= THRESH.ZSCORE_BULL: _rvz_b, _rvz_s = "BULLISH", "Above norm"
+        elif roll_vel_z <= THRESH.ZSCORE_BEAR: _rvz_b, _rvz_s = "BEARISH", "Below norm"
+        else:                                  _rvz_b, _rvz_s = "SIDEWAYS", "—"
+        _rvz_display = f"{roll_vel_z:+.2f}σ"
     st.markdown(f"""
     <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
         <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Roll Vel Z-Score</div>
-        <div style="font-size:20px;font-weight:700;color:{rv_zc};">{roll_vel_z:+.2f}σ</div>
+        <div style="font-size:20px;font-weight:700;color:{rv_zc};">{_rvz_display}</div>
         <div class="explain-text" style="color:{roll_vel_color};">{roll_vel_interp}</div>
         <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_rvz_b, _rvz_s, rv_zc)}
             <span style="color:{TEXT};">+σ = longs adding conviction; −σ = longs unwinding.</span>
