@@ -1,28 +1,37 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  Commodities Options Analysis Dashboard v5.0 (GOLDM & SILVERM)     ║
+║  Commodities FUTURES-ONLY Analysis Dashboard v6.1                    ║
+║  (GOLDM · SILVERM · GOLDPETAL)                                       ║
 ║  Streamlit Edition — Deploy on Streamlit Community Cloud            ║
-║  Data: Dhan API (primary) | Demo Mode (fallback)                   ║
-║  v5: bug fixes (BUG-1..BUG-8) + methodology fixes (METH-1..METH-10)║
-║  Changes:                                                          ║
-║   • BUG-1: Velocity/z-score now reflect current tick               ║
-║   • BUG-2: Rolling window z-score (last N ticks)                   ║
-║   • BUG-3: Stable denominator with OI-relative floor, sign from d_next ║
-║   • BUG-4: Negative velocity buckets in chart                      ║
-║   • BUG-5: Carry anomaly uses correct days_to_next_expiry          ║
-║   • BUG-6: No fabricated OI when API returns zero                  ║
-║   • BUG-7: Insufficient z-score returns None (UI shows —)          ║
-║   • BUG-8: Row-by-row greek fill                                   ║
-║   • METH-1: Vanna documented as heuristic proxy                    ║
-║   • METH-2: GEX formula documented in code                         ║
-║   • METH-3: Continuous (linear) scoring replaces step function     ║
-║   • METH-4: Centralised Thresholds class                           ║
-║   • METH-5: Multi-day history retention (default 7 days)           ║
-║   • METH-6: Wing-excess window scaled by atm_iv × √T              ║
-║   • METH-7: Symbol-aware gamma regime thresholds                   ║
-║   • METH-8: Symmetric weighting in combined bias matrix            ║
-║   • METH-9: Strategy leg validation + fallback                     ║
-║   • METH-10: IV solver returns NaN, surfaces failure ratio         ║
+║  Data: Dhan API (primary) | Demo Mode (fallback)                    ║
+║  v6.0 — surgical conversion from v5 (options+futures) to futures-only:║
+║   • REMOVED: option chain fetch/analysis, Black-Scholes/Greeks,     ║
+║     IV solver, GEX, Vanna, Gamma Regime, IV Smile, Max Pain, PCR,   ║
+║     Net Delta/Momentum, option-based OI velocity & regime bias,     ║
+║     Carry Anomaly (required option-implied ATM IV — no longer       ║
+║     available without an option chain), option chain table.         ║
+║   • KEPT UNCHANGED: futures roll fetch (near/next/far), term        ║
+║     structure, rollover %, roll spread, rollover velocity + z-score, ║
+║     intraday OI recorder, term-structure & rollover-velocity charts. ║
+║   • Final bias scoring, decision matrix and strategy recommendation  ║
+║     now run on FUTURES SIGNALS ONLY.                                 ║
+║   • ADDED: GOLD PETAL (GOLDPETAL) as a selectable MCX asset class.   ║
+║  v6.1 — practical follow-up improvements:                            ║
+║   • Symbol resolution now has a loose fallback match + an owner-only ║
+║     diagnostics panel showing whether each symbol (esp. GOLDPETAL)   ║
+║     actually resolved real contracts from Dhan's master CSV.         ║
+║   • oi_history (rollover-velocity z-score baseline) now persists to  ║
+║     disk, pruned to the current day, so it survives an app restart   ║
+║     instead of resetting to "Collecting data…" every time.           ║
+║   • Directional thresholds are now symbol-aware via get_thresh() /   ║
+║     SYMBOL_THRESH_OVERRIDES (currently identical defaults — override ║
+║     per symbol once real history is collected).                      ║
+║   • A visible "DEMO DATA" banner now appears above the score/verdict ║
+║     whenever the live feed fell back to simulated roll data.         ║
+║   • Added a "Score Trend — Today's Session" chart.                   ║
+║   • Added an owner-only Score Calibration Check that reads the       ║
+║     already-logged decision-log CSVs and buckets forward price       ║
+║     moves by score range (a sanity check, not a rigorous backtest).  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -35,14 +44,12 @@ def strftime_ist(fmt: str):  return now_ist().strftime(fmt)
 
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
-from scipy.optimize import brentq
 import streamlit as st
 import plotly.graph_objs as go
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Commodity Options Dashboard v5",
+st.set_page_config(page_title="Commodity Futures Dashboard v6",
                    page_icon="🌟", layout="wide", initial_sidebar_state="collapsed")
 
 class CFG:
@@ -57,21 +64,54 @@ class CFG:
     USE_DHAN      = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
     USE_DEMO_MODE = not USE_DHAN
 
-RISK_FREE_RATE       = 0.065
-ATM_BAND             = 20
 AUTO_REFRESH_SECONDS = 60
 
-DHAN_SECURITY = {
-    "GOLDM":   {"id": 117, "seg": "MCX_COMM", "step": 100},
-    "SILVERM": {"id": 122, "seg": "MCX_COMM", "step": 1000},
+# ─────────────────────────────────────────────────────────────────────
+#  ASSET CLASSES — MCX commodity futures
+#  GOLDPETAL added as a selectable asset class alongside GOLDM/SILVERM.
+# ─────────────────────────────────────────────────────────────────────
+COMMODITY_SYMBOLS = ["GOLDM", "SILVERM", "GOLDPETAL"]
+SYMBOL_LABELS = {
+    "GOLDM":     "Gold Mini (GOLDM)",
+    "SILVERM":   "Silver Mini (SILVERM)",
+    "GOLDPETAL": "Gold Petal (GOLDPETAL)",
 }
-COMMODITY_SYMBOLS = ["GOLDM", "SILVERM"]
+
+# Populated by _resolve_symbol_df() each time the master CSV is parsed —
+# lets the owner-only "Data Source Diagnostics" panel show, at runtime,
+# whether each symbol (especially the newly-added GOLDPETAL) actually
+# resolved to real MCX contracts instead of silently returning nothing.
+_SYMBOL_MATCH_INFO = {}
+
+def _resolve_symbol_df(df_mc, sym):
+    """Match a symbol's futures contracts by trading-symbol prefix.
+    Tries a strict prefix match first (as before); if that returns nothing
+    — e.g. Dhan uses a slightly different prefix than expected for a symbol
+    that was just added — falls back to a loose 'contains' match instead of
+    silently returning zero contracts. Records what happened in
+    _SYMBOL_MATCH_INFO so it can be surfaced in the UI."""
+    patterns = {"GOLDM": r'^GOLDM', "SILVERM": r'^SILVERM', "GOLDPETAL": r'^GOLDPETAL'}
+    pat = patterns.get(sym)
+    if pat:
+        df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(pat, na=False)]
+        used = f"strict prefix '{pat}'"
+        if df_sym.empty:
+            df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.contains(sym, case=False, na=False)]
+            used = f"fallback contains '{sym}' (strict prefix matched nothing)"
+    else:
+        df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.startswith(sym)]
+        used = f"startswith '{sym}'"
+    _SYMBOL_MATCH_INFO[sym] = {
+        "pattern_used": used,
+        "matched": not df_sym.empty,
+        "count": int(len(df_sym)),
+        "sample": df_sym['SEM_TRADING_SYMBOL'].unique().tolist()[:5] if not df_sym.empty else [],
+    }
+    return df_sym
 
 # ─────────────────────────────────────────────────────────────────────
-#  CENTRALISED THRESHOLDS (METH-4)
-#  Single source of truth for all metric thresholds — eliminates the
-#  previous 1.2-vs-1.3-vs-0.8 inconsistencies across functions.
-#  Import or reference THRESH everywhere instead of magic numbers.
+#  CENTRALISED THRESHOLDS — futures-only signals
+#  Single source of truth for all metric thresholds.
 # ─────────────────────────────────────────────────────────────────────
 class THRESH:
     # Rollover velocity (ratio of Δ next OI to |Δ near OI|)
@@ -82,51 +122,9 @@ class THRESH:
     ROLL_VEL_LIQUID_MILD = -0.3  # ≥ → mild liquidation
     ROLL_VEL_LIQUID_HARD = -1.0  # < → hard liquidation
 
-    # Velocity z-score
+    # Rollover-velocity z-score
     ZSCORE_BULL          = 1.0   # ≥ → bullish (above norm)
     ZSCORE_BEAR          = -1.0  # ≤ → bearish (below norm)
-    ZSCORE_SURGE         = 2.0   # ≥ → surge alert
-    ZSCORE_UNWIND        = -2.0  # ≤ → unwind alert
-    ZSCORE_WATCH         = 1.2   # ≥ → watch level (mild elevation)
-    ZSCORE_EASING        = -1.2  # ≤ → easing level
-
-    # OI velocity z-score (separate from rollover velocity)
-    OI_VEL_SURGE         = 2.0
-    OI_VEL_WATCH         = 1.2
-    OI_VEL_EASING        = -1.2
-    OI_VEL_UNWIND        = -2.0
-
-    # Net delta thresholds (OI-weighted)
-    NET_DELTA_STRONG_BULL = 5000
-    NET_DELTA_MILD_BULL   = 1000
-    NET_DELTA_STRONG_BEAR = -5000
-    NET_DELTA_MILD_BEAR   = -1000
-
-    # Momentum thresholds
-    MOM_STRONG_BULL = 2000
-    MOM_MILD_BULL   = 500
-    MOM_STRONG_BEAR = -2000
-    MOM_MILD_BEAR   = -500
-
-    # EV ratio
-    EV_STRONG_BULL = 1.3
-    EV_MILD_BULL   = 1.1
-    EV_STRONG_BEAR = 0.7
-    EV_MILD_BEAR   = 0.9
-
-    # PCR
-    PCR_STRONG_BULL = 1.3
-    PCR_MILD_BULL   = 1.0
-    PCR_STRONG_BEAR = 0.5
-    PCR_MILD_BEAR   = 0.7
-
-    # ATM pressure
-    ATP_STRONG_BULL = 2000
-    ATP_STRONG_BEAR = -2000
-
-    # Carry anomaly
-    CARRY_ANOM_BIG_MOVE   = 1.5   # ≥ → big move priced
-    CARRY_ANOM_NORMAL     = 0.5   # ≤ → normal carry
 
     # Roll spread %
     ROLL_SPREAD_STRONG_CONTANGO  = 0.2
@@ -140,12 +138,31 @@ class THRESH:
     ROLL_VEL_ZSCORE_WINDOW = 20   # ticks (≈ 20 min at 60s refresh)
     ROLL_VEL_ZSCORE_MIN    = 5    # need at least this many samples
 
-    # History retention (METH-5)
+    # History retention
     HISTORY_RETENTION_DAYS = 7
     HISTORY_MAX_TICKS       = 600   # per symbol
 
-    # IV solver failure tolerance (METH-10)
-    IV_FAIL_WARN_PCT = 0.20   # surface warning if > 20 % strikes fail
+# ─────────────────────────────────────────────────────────────────────
+#  SYMBOL-AWARE THRESHOLD OVERRIDES
+#  The THRESH values above are shared defaults, originally tuned on
+#  GOLDM/SILVERM. GOLDPETAL is a much smaller (1 gram) contract and may
+#  show different noise characteristics in roll spread % / rollover
+#  velocity — these overrides are UNCALIBRATED placeholders (currently
+#  identical to the defaults) until real GOLDPETAL history is collected.
+#  Add per-symbol keys here once you've logged a few weeks of data — the
+#  owner-only "Threshold Calibration" panel further down shows the
+#  effective thresholds currently in force for the selected symbol.
+# ─────────────────────────────────────────────────────────────────────
+SYMBOL_THRESH_OVERRIDES = {
+    # Example — uncomment / adjust once you have real GOLDPETAL data:
+    # "GOLDPETAL": {"ROLL_SPREAD_STRONG_CONTANGO": 0.15, "ROLLOVER_PCT_ADVANCED": 35},
+}
+
+def get_thresh(symbol, name):
+    """Symbol-aware threshold lookup. Falls back to the shared THRESH class
+    default when no override is defined for this symbol."""
+    override = SYMBOL_THRESH_OVERRIDES.get(symbol, {})
+    return override.get(name, getattr(THRESH, name))
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_dynamic_futures_ids():
@@ -158,12 +175,7 @@ def get_dynamic_futures_ids():
         df_mc = df[(df['SEM_EXM_EXCH_ID'] == 'MCX') & (df['SEM_INSTRUMENT_NAME'] == 'FUTCOM')]
         id_map = {}
         for sym in COMMODITY_SYMBOLS:
-            if sym == "GOLDM":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLDM')]
-            elif sym == "SILVERM":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVERM')]
-            else:
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.startswith(sym)]
+            df_sym = _resolve_symbol_df(df_mc, sym)
             df_sym = df_sym.dropna(subset=['SEM_EXPIRY_CODE']).sort_values('SEM_EXPIRY_CODE')
             if len(df_sym) >= 3:
                 id_map[sym] = [int(df_sym.iloc[i]['SEM_SMST_SECURITY_ID']) for i in range(3)]
@@ -201,12 +213,7 @@ def get_futures_contracts():
             except Exception: return raw
 
         for sym in COMMODITY_SYMBOLS:
-            if sym == "GOLDM":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^GOLDM')]
-            elif sym == "SILVERM":
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.match(r'^SILVERM')]
-            else:
-                df_sym = df_mc[df_mc['SEM_TRADING_SYMBOL'].str.startswith(sym)]
+            df_sym = _resolve_symbol_df(df_mc, sym)
             exp_col = 'SEM_EXPIRY_DATE' if 'SEM_EXPIRY_DATE' in df_sym.columns else 'SEM_EXPIRY_CODE'
             df_sym  = df_sym.dropna(subset=[exp_col]).copy()
             df_sym['_exp'] = df_sym[exp_col].apply(_parse_exp)
@@ -233,46 +240,26 @@ PINK       = "#DB2777"; BORDER     = "#E2E8F0"; SECTION_BG = "#F1F5F9"
 PURPLE     = "#7C3AED"
 
 METRIC_EXPLAIN = {
-    "EV Ratio":          "Call vs put time-value; >1.2 = bulls paying more (bullish), <0.8 = bears paying more (bearish).",
-    "Net Delta":         "Overall directional bias from open positions; positive = net bullish, negative = net bearish.",
-    "GEX":               "Gamma Exposure = Σ(call_oi·call_gamma − put_oi·put_gamma) × spot² × 0.01 — 'dollar gamma per 1% move'. Positive GEX pins the market, negative GEX amplifies moves.",
-    "Vanna":             "HEURISTIC PROXY (not textbook vanna): OI-weighted (vega × delta) normalised by spot. Sign indicates whether rising IV helps bulls (+) or bears (−). Treat as directional bias only.",
-    "Momentum":          "Fresh money entering calls vs puts; positive = new bullish bets, negative = fresh bearish.",
-    "Vega Skew":         "Call vega vs put vega; >1 = calls more IV-sensitive (bullish tone).",
-    "G/T Ratio":         "Gamma-to-Theta ratio; high = market is unstable and trending.",
-    "PCR":               "Put-Call Ratio; >1 = more puts, <0.7 = excessive calls (potential top).",
-    "Max Pain":          "Strike where option writers lose least; market gravitates here near expiry.",
-    "ATM Pressure":      "Near-ATM put OI change vs call OI change; positive = support building.",
-    "Skew Slope":        "Put IV slope vs call IV slope; high = fear of downside moves.",
-    "IV Rank":           "ATM IV rank within smile range (0=low, 100=high). High IV favors premium selling.",
-    "Gamma Flip":        "Strike where cumulative GEX crosses zero. Below flip = trend amplification zone.",
-    "Wall Width":        "Distance between highest put OI strike (support) and highest call OI (resistance).",
-    "Near OI %":         "Share of OI concentrated near ATM; high = strong pin, low = diffuse positioning.",
     "Roll Spread":       "Price difference between near and next futures — positive = contango (normal carry).",
     "Spread %":          "Roll spread as % of near-month price — measures carry cost in percentage terms.",
     "Rollover %":        "How much OI has shifted to next month — high % means expiry rollover well advanced.",
     "Term Structure":    "Shape of the futures curve across 3 months — steepening contango signals bullish carry.",
-    "Carry Anomaly":     "Actual roll cost vs what IV implies it should cost — above 1.5 means futures pricing a big move.",
-    "Rollover Velocity": "Rate of OI moving from near to next month — above 1.2 means longs are adding conviction.",
+    "Rollover Velocity": "Rate of OI moving from near to next month — above 1.3 means longs are adding conviction.",
     "Near Vol/OI":       "Volume-to-OI ratio for near-month — above 0.3 means active fresh positioning.",
     "Slope Near→Next":   "Annualised carry from near to next month — positive = contango (bullish carry).",
     "Slope Next→Far":    "Annualised carry from next to far month — steeper = bullish acceleration.",
-    "Gamma Regime":      "5-state market structure: PINNED (low vol) → TREND/EXPANSION (high vol) → FLIP ZONE (danger).",
 }
 # ─────────────────────────────────────────────────────────────────────
 #  HISTORY PERSISTENCE
 # ─────────────────────────────────────────────────────────────────────
-HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commodity_oi_history.json")
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commodity_futures_history.json")
 LOG_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commodity_decision_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 _CSV_COLUMNS = [
-    "ts", "symbol", "spot", "expiry", "atm", "atm_iv", "iv_rank",
-    "gex", "gamma_flip", "pcr", "net_delta", "momentum", "atm_pressure",
-    "gt_ratio", "support", "resistance", "wall_width", "max_pain",
-    "call_oi_total", "put_oi_total", "score",
-    "put_wing_excess", "call_wing_excess",
+    "ts", "symbol", "near_ltp", "next_ltp", "far_ltp",
     "roll_spread_pct", "rollover_pct", "ts_bias",
+    "rollover_velocity", "roll_vel_z", "score",
 ]
 
 def _get_log_paths():
@@ -294,7 +281,7 @@ def write_decision_log(record: dict):
     except Exception as e: print(f"[DecisionLog] {e}")
 
 def _prune_to_history_window(history):
-    """METH-5: keep HISTORY_RETENTION_DAYS of ticks (not just today) so z-scores
+    """Keep HISTORY_RETENTION_DAYS of ticks (not just today) so z-scores
     have a meaningful baseline. Returns dict {symbol: [tick,...]} with old ticks pruned."""
     cutoff = (date.today() - timedelta(days=THRESH.HISTORY_RETENTION_DAYS)).isoformat()
     pruned = {}
@@ -333,6 +320,55 @@ def save_history_to_disk(history):
     except Exception as e: print(f"[History] Save error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────
+#  OI-HISTORY PERSISTENCE
+#  Previously oi_history (which drives rollover velocity + its z-score —
+#  a core signal in the bias matrix) lived only in Streamlit's in-memory
+#  session state: it reset to "Collecting data…" on every server restart,
+#  which matters in practice because Streamlit Community Cloud sleeps and
+#  restarts idle apps. Persisting it the same way as `history` means the
+#  z-score baseline survives a restart instead of re-warming from scratch.
+#  Ticks are pruned to TODAY ONLY on load (not the 7-day window used for
+#  `history`) because near/next OI levels reset around rollover and mixing
+#  yesterday's OI base into today's velocity calc would be wrong.
+# ─────────────────────────────────────────────────────────────────────
+OI_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commodity_futures_oi_history.json")
+
+def _disp_hm(ts: str) -> str:
+    """Extract just the HH:MM portion for chart x-axis labels, regardless of
+    whether `ts` is 'YYYY-MM-DD HH:MM' (new format) or bare 'HH:MM' (old
+    format, kept for backward compatibility with any already-saved file)."""
+    ts = str(ts)
+    return ts.split(" ")[-1] if " " in ts else ts
+
+def _prune_oi_to_today(oi_history):
+    """Keep only today's ticks — OI velocity should never be computed across
+    a day boundary (rollover / fresh session), so stale ticks from a
+    previous day are dropped on load rather than silently blended in."""
+    today = date.today().isoformat()
+    pruned = {}
+    for s, ticks in oi_history.items():
+        if not isinstance(ticks, list): continue
+        pruned[s] = [t for t in ticks if isinstance(t, dict) and str(t.get("ts", "")).startswith(today)]
+    return pruned
+
+def load_oi_history_from_disk():
+    try:
+        if os.path.exists(OI_HISTORY_FILE):
+            with open(OI_HISTORY_FILE, "r", encoding="utf-8") as f: raw = json.load(f)
+            p = _prune_oi_to_today(raw)
+            print(f"[OIHistory] Loaded {sum(len(v) for v in p.values())} ticks (today only)"); return p
+    except Exception as e: print(f"[OIHistory] Load error: {e}")
+    return {}
+
+def save_oi_history_to_disk(oi_history):
+    try:
+        tmp = OI_HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in oi_history.items() if isinstance(v, list)}, f)
+        os.replace(tmp, OI_HISTORY_FILE)
+    except Exception as e: print(f"[OIHistory] Save error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────
 #  UTILITY
 # ─────────────────────────────────────────────────────────────────────
 def safe_num(x, d=0.0):
@@ -346,132 +382,14 @@ def _zscore(arr, window):
     w = arr[-window:]; std = w.std()
     return float((w[-1] - w.mean()) / std) if std > 1e-9 else 0.0
 
-def _extract_sym_history(history, symbol):
-    if isinstance(history, dict):
-        ticks = history.get(symbol, [])
-        if ticks: return ticks
-        sym_keys = [k for k in history if isinstance(history[k], list)]
-        return history[max(sym_keys, key=lambda k: len(history[k]))] if sym_keys else []
-    return history if isinstance(history, list) else []
-
 # ─────────────────────────────────────────────────────────────────────
-#  BLACK-SCHOLES
-# ─────────────────────────────────────────────────────────────────────
-def _bs_price(S, K, T, r, sigma, opt):
-    if T <= 0 or sigma <= 0: return 0.0
-    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T)); d2 = d1 - sigma*np.sqrt(T)
-    return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2) if opt=="CE" else K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1)
-
-def _bs_greeks(S, K, T, r, sigma, opt):
-    if T <= 0 or sigma <= 0: return 0,0,0,0
-    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T)); d2 = d1 - sigma*np.sqrt(T)
-    nd1   = norm.pdf(d1)
-    delta = norm.cdf(d1) if opt=="CE" else -norm.cdf(-d1)
-    gamma = nd1 / (S*sigma*np.sqrt(T))
-    theta = (-(S*nd1*sigma)/(2*np.sqrt(T)) - r*K*np.exp(-r*T)*norm.cdf(d2 if opt=="CE" else -d2)) / 365
-    vega  = S*nd1*np.sqrt(T) / 100
-    return delta, gamma, theta, vega
-
-def _solve_iv(mkt, S, K, T, r, opt):
-    """METH-10 fix: return NaN instead of 0.0 on failure.
-
-    Old: returned 0.0 on any failure (T<=0, mkt<=0, brentq exception).
-         A 0.0 IV then silently propagated into smile charts and Greeks,
-         making deep-OTM wings look artificially cheap.
-
-    New: return float('nan'). Callers (e.g., smile computation, IV rank)
-         can mask NaN before plotting/aggregating, and the dashboard can
-         surface a warning when too many strikes fail.
-    """
-    if T <= 0 or mkt <= 0: return float('nan')
-    try:
-        return brentq(lambda v: _bs_price(S,K,T,r,v,opt) - mkt, 1e-4, 5.0, xtol=1e-5, maxiter=100)
-    except Exception:
-        return float('nan')
-
-# ─────────────────────────────────────────────────────────────────────
-#  DHAN FETCHERS
-#  Cache option chain AND futures-roll calls for 55s (just under the
-#  60s refresh cycle) so concurrent viewers share API calls instead of
-#  hitting Dhan per-visitor.
-#  fetch_futures_roll() uses /v2/marketfeed/quote (not option chain), so
-#  total Dhan API calls per cold 55s window: expiry list + option chain
-#  + quote = 3 (then cached for the rest of the window).
-# ─────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=55, show_spinner=False)
-def fetch_dhan_expiry_list(symbol="GOLDM"):
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
-    headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
-    try:
-        resp     = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
-                                 json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]}, timeout=15)
-        expiries = resp.json().get("data", [])
-        today    = date.today().isoformat()
-        return [e for e in expiries if e >= today]
-    except Exception as e: print(f"[Dhan] Expiry list error: {e}"); return []
-
-@st.cache_data(ttl=55, show_spinner=False)
-def fetch_dhan_option_chain(symbol="GOLDM", expiry=None):
-    if not CFG.USE_DHAN: return pd.DataFrame(), 0.0, ""
-    sec     = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])
-    headers = {"access-token": CFG.DHAN_ACCESS_TOKEN, "client-id": str(CFG.DHAN_CLIENT_ID), "Content-Type": "application/json"}
-    if expiry is None:
-        try:
-            er  = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
-                                json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]}, timeout=15)
-            exl = er.json().get("data", []); today = date.today().isoformat()
-            fut = [e for e in exl if e >= today]; expiry = fut[0] if fut else (exl[0] if exl else "")
-        except Exception as e: print(f"[Dhan] Expiry list error: {e}"); return pd.DataFrame(), 0.0, ""
-    if not expiry: return pd.DataFrame(), 0.0, ""
-    try:
-        r    = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
-                             json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry}, timeout=20)
-        resp = r.json()
-    except Exception as e: print(f"[Dhan] OC error: {e}"); return pd.DataFrame(), 0.0, expiry
-    if resp.get("status") != "success": return pd.DataFrame(), 0.0, expiry
-    data = resp.get("data", {}); spot = float(data.get("last_price", 0))
-    rows = []
-    for ks, chain in data.get("oc", {}).items():
-        K  = float(ks)
-        ce = chain.get("ce", {}) or {}; pe = chain.get("pe", {}) or {}
-        cg = ce.get("greeks", {}) or {}; pg = pe.get("greeks", {}) or {}
-        rows.append({
-            "strike":       K,
-            "call_ltp":     float(ce.get("last_price",0) or 0),
-            "call_oi":      int(ce.get("oi",0) or 0),
-            "call_prev_oi": int(ce.get("previous_oi",0) or 0),
-            "call_oi_chg":  int(ce.get("oi",0) or 0) - int(ce.get("previous_oi",0) or 0),
-            "call_vol":     int(ce.get("volume",0) or 0),
-            "call_bid":     float(ce.get("top_bid_price",0) or 0),
-            "call_ask":     float(ce.get("top_ask_price",0) or 0),
-            "call_iv":      float(ce.get("implied_volatility",0) or 0),
-            "call_delta":   float(cg.get("delta",0) or 0),
-            "call_gamma":   float(cg.get("gamma",0) or 0),
-            "call_theta":   float(cg.get("theta",0) or 0),
-            "call_vega":    float(cg.get("vega",0) or 0),
-            "put_ltp":      float(pe.get("last_price",0) or 0),
-            "put_oi":       int(pe.get("oi",0) or 0),
-            "put_prev_oi":  int(pe.get("previous_oi",0) or 0),
-            "put_oi_chg":   int(pe.get("oi",0) or 0) - int(pe.get("previous_oi",0) or 0),
-            "put_vol":      int(pe.get("volume",0) or 0),
-            "put_bid":      float(pe.get("top_bid_price",0) or 0),
-            "put_ask":      float(pe.get("top_ask_price",0) or 0),
-            "put_iv":       float(pe.get("implied_volatility",0) or 0),
-            "put_delta":    float(pg.get("delta",0) or 0),
-            "put_gamma":    float(pg.get("gamma",0) or 0),
-            "put_theta":    float(pg.get("theta",0) or 0),
-            "put_vega":     float(pg.get("vega",0) or 0),
-        })
-    return pd.DataFrame(rows).sort_values("strike").reset_index(drop=True), spot, expiry
-
-# ─────────────────────────────────────────────────────────────────────
-#  FUTURES ROLL — 3-MONTH
+#  FUTURES ROLL — 3-MONTH  (UNCHANGED FROM v5)
 #  Uses /v2/marketfeed/quote (ONE call) for LTP + futures OI + volume.
 #  Falls back to /v2/marketfeed/ltp if quote gives no prices.
 #  Expiry dates come from master CSV via get_futures_contracts() — no
 #  option-chain expiry-list or _fetch_oi calls, so zero extra API hits.
-#  Cached for 55s (matching option-chain fetchers) so concurrent viewers
-#  share one quote call per 55s window instead of hitting Dhan per visitor.
+#  Cached for 55s so concurrent viewers share one quote call per 55s
+#  window instead of hitting Dhan per visitor.
 # ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_futures_roll(symbol="GOLDM") -> dict:
@@ -614,47 +532,17 @@ def fetch_futures_roll(symbol="GOLDM") -> dict:
         "near_tsym":   near_tsym,   "next_tsym":   next_tsym,   "far_tsym":   far_tsym,
         "has_far": bool(far_expiry and far_ltp > 0),
     }
-# ─────────────────────────────────────────────────────────────────────
-#  DEMO MODE
-# ─────────────────────────────────────────────────────────────────────
-def fetch_demo_option_chain(symbol="GOLDM"):
-    np.random.seed(int(time.time()) // 60)
-    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-    spot = (93500.0 if "GOLD" in symbol else 96500.0) + np.random.normal(0, 150 if "GOLD" in symbol else 300)
-    atm     = round(spot / step) * step
-    strikes = np.arange(atm - 25*step, atm + 26*step, step)
-    T = 10/365.0; r = RISK_FREE_RATE; vix = 18.5 + np.random.normal(0,1)
-    rows = []
-    for K in strikes:
-        mono = (K - spot)/spot
-        iv_c = max(0.05, (vix/100) + 0.015*mono**2 + abs(mono)*0.04 + np.random.normal(0,0.005))
-        iv_p = max(0.05, (vix/100) + 0.025*mono**2 - mono*0.03     + np.random.normal(0,0.005))
-        cp = _bs_price(spot,K,T,r,iv_c,"CE"); pp = _bs_price(spot,K,T,r,iv_p,"PE")
-        cd,cg,ct,cv  = _bs_greeks(spot,K,T,r,iv_c,"CE")
-        pd2,pg,pt,pv = _bs_greeks(spot,K,T,r,iv_p,"PE")
-        cof = max(0, 2+mono*8)*np.random.lognormal(0,0.4)
-        pof = max(0, 2-mono*9)*np.random.lognormal(0,0.4)
-        rows.append({
-            "strike": K,
-            "call_ltp": round(max(0.05,cp+np.random.normal(0,0.3)),2),
-            "call_oi": int(max(10,cof*800)), "call_oi_chg": int(np.random.normal(20,150)),
-            "call_vol": int(abs(np.random.normal(300,150))),
-            "call_bid": round(max(0.05,cp-2),2), "call_ask": round(cp+2,2),
-            "call_iv": round(iv_c*100,2), "call_delta": round(cd,4),
-            "call_gamma": round(cg,6), "call_theta": round(ct,4), "call_vega": round(cv,4),
-            "put_ltp": round(max(0.05,pp+np.random.normal(0,0.3)),2),
-            "put_oi": int(max(10,pof*1000)), "put_oi_chg": int(np.random.normal(-10,180)),
-            "put_vol": int(abs(np.random.normal(350,200))),
-            "put_bid": round(max(0.05,pp-2),2), "put_ask": round(pp+2,2),
-            "put_iv": round(iv_p*100,2), "put_delta": round(pd2,4),
-            "put_gamma": round(pg,6), "put_theta": round(pt,4), "put_vega": round(pv,4),
-        })
-    expiry = (date.today() + timedelta(days=10)).strftime("%Y-%m-%d")
-    return pd.DataFrame(rows), round(spot,2), expiry
 
+# ─────────────────────────────────────────────────────────────────────
+#  DEMO MODE — futures roll only. Base prices scaled per symbol so the
+#  Gold Petal (1 gram lot, ~1/10th GOLDM price) demo data looks realistic.
+# ─────────────────────────────────────────────────────────────────────
 def demo_futures_roll(symbol="GOLDM") -> dict:
-    near_ltp = (93500.0 if "GOLD" in symbol else 96500.0) + np.random.normal(0,80)
-    spread1  = abs(np.random.normal(120,40)); spread2 = abs(np.random.normal(110,35))
+    _base = {"GOLDM": 93500.0, "SILVERM": 96500.0, "GOLDPETAL": 9350.0}.get(
+        symbol, 93500.0 if "GOLD" in symbol else 96500.0)
+    near_ltp = _base + np.random.normal(0, _base*0.00085)
+    spread1  = abs(np.random.normal(_base*0.00128, _base*0.00043))
+    spread2  = abs(np.random.normal(_base*0.00118, _base*0.00037))
     next_ltp = near_ltp + spread1; far_ltp = next_ltp + spread2
     near_oi  = int(np.random.normal(18000,2000)); next_oi = int(np.random.normal(4500,800))
     far_oi   = int(np.random.normal(800,200));    total_oi = near_oi + next_oi
@@ -692,389 +580,82 @@ def demo_futures_roll(symbol="GOLDM") -> dict:
         "has_far": True,
     }
 
-def get_option_chain(symbol="GOLDM", expiry=None):
-    if CFG.USE_DHAN:
-        df, spot, exp = fetch_dhan_option_chain(symbol, expiry)
-        if not df.empty: return df, spot, exp, "Dhan API (MCX)"
-    df, spot, exp = fetch_demo_option_chain(symbol)
-    return df, spot, exp, "DEMO MODE (Commodities)"
-
 # ─────────────────────────────────────────────────────────────────────
-#  METRICS ENGINE
-# ─────────────────────────────────────────────────────────────────────
-def select_atm_band(df, spot, symbol="GOLDM"):
-    step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-    strikes = sorted(df["strike"].unique())
-    atm     = min(strikes, key=lambda x: abs(x - spot))
-    return df[df["strike"].between(atm - ATM_BAND*step, atm + ATM_BAND*step)].copy(), atm
-
-def compute_max_pain(df):
-    results = {}
-    for K in df["strike"]:
-        cl = (df[df["strike"] < K]["call_oi"] * (K - df[df["strike"] < K]["strike"])).sum()
-        pl = (df[df["strike"] > K]["put_oi"]  * (df[df["strike"] > K]["strike"] - K)).sum()
-        results[K] = cl + pl
-    return min(results, key=results.get) if results else 0.0
-
-def _fill_missing_greeks(df_band, spot, expiry=None):
-    """BUG-8 fix: fill greeks row-by-row instead of all-or-nothing.
-
-    Old behaviour: if ANY call_gamma or put_gamma was non-zero, the entire
-    band was returned unchanged. This meant that when the API populated
-    greeks for ATM strikes but left wing strikes with gamma=0 (common with
-    Dhan's truncation), the wing strikes never got filled, breaking smile
-    computations downstream.
-
-    New behaviour: check each row independently. For each strike, if either
-    call_gamma or put_gamma is missing (≈0), recompute all four call and
-    four put greeks from BS using the row's own IV. Do NOT overwrite IV.
-    """
-    if df_band.empty: return df_band
-    try:
-        T = max((datetime.strptime(expiry[:10],"%Y-%m-%d").date() - date.today()).days, 1)/365.0 if expiry else 10/365.0
-    except Exception: T = 10/365.0
-    r   = RISK_FREE_RATE
-    df2 = df_band.copy()
-    for idx, row in df2.iterrows():
-        K = float(row["strike"])
-        cg = float(row.get("call_gamma", 0) or 0)
-        pg = float(row.get("put_gamma",  0) or 0)
-        # Fill this row only if both call_gamma and put_gamma are missing
-        if abs(cg) < 1e-9 and abs(pg) < 1e-9:
-            iv_c = float(row.get("call_iv", 0) or 0) / 100.0
-            iv_p = float(row.get("put_iv",  0) or 0) / 100.0
-            iv_c = iv_c if iv_c > 0.01 else 0.15
-            iv_p = iv_p if iv_p > 0.01 else 0.15
-            cd, cgg, ct, cv  = _bs_greeks(spot, K, T, r, iv_c, "CE")
-            pd2, pgg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
-            df2.at[idx, "call_delta"] = cd; df2.at[idx, "call_gamma"] = cgg
-            df2.at[idx, "call_theta"] = ct; df2.at[idx, "call_vega"]  = cv
-            df2.at[idx, "put_delta"]  = pd2; df2.at[idx, "put_gamma"] = pgg
-            df2.at[idx, "put_theta"]  = pt;  df2.at[idx, "put_vega"]  = pv
-    return df2
-
-def compute_gamma_flip(df_band, spot):
-    if df_band.empty: return None
-    cum = 0.0
-    for K in sorted(df_band["strike"].unique()):
-        row = df_band[df_band["strike"]==K]
-        if row.empty: continue
-        gk = (float(row["call_gamma"].values[0])*float(row["call_oi"].values[0]) -
-              float(row["put_gamma"].values[0]) *float(row["put_oi"].values[0])) * spot**2 * 0.01
-        prev = cum; cum += gk
-        if prev > 0 and cum <= 0: return K
-        if prev < 0 and cum >= 0: return K
-    return None
-
-def compute_iv_rank(df_band):
-    all_ivs = pd.concat([df_band["call_iv"], df_band["put_iv"]]).dropna()
-    all_ivs = all_ivs[all_ivs > 0]
-    if all_ivs.empty: return 50.0
-    iv_min = all_ivs.min(); iv_max = all_ivs.max(); atm_iv = all_ivs.median()
-    return round((atm_iv - iv_min)/(iv_max - iv_min)*100, 1) if iv_max != iv_min else 50.0
-
-def compute_metrics(df, spot, symbol="GOLDM", expiry=None):
-    if df.empty: return {}
-    df_band, atm = select_atm_band(df, spot, symbol)
-    df_band = _fill_missing_greeks(df_band, spot, expiry)
-    step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-
-    df_band["intr_c"] = np.maximum(0, spot - df_band["strike"])
-    df_band["ev_c"]   = np.maximum(0, df_band["call_ltp"] - df_band["intr_c"])
-    df_band["intr_p"] = np.maximum(0, df_band["strike"] - spot)
-    df_band["ev_p"]   = np.maximum(0, df_band["put_ltp"]  - df_band["intr_p"])
-
-    ev_sum_c = df_band["ev_c"].sum(); ev_sum_p = df_band["ev_p"].sum()
-    ev_ratio = ev_sum_c/ev_sum_p if ev_sum_p > 0 else 1.0
-    net_delta = ((df_band["call_oi"]*df_band["call_delta"]).sum() + (df_band["put_oi"]*df_band["put_delta"]).sum())
-    net_gamma = ((df_band["call_oi"]*df_band["call_gamma"]).sum() + (df_band["put_oi"]*df_band["put_gamma"]).sum())
-    net_theta = ((df_band["call_oi"]*df_band["call_theta"]).sum() + (df_band["put_oi"]*df_band["put_theta"]).sum())
-    gex   = ((df_band["call_oi"]*df_band["call_gamma"]).sum() - (df_band["put_oi"]*df_band["put_gamma"]).sum()) * spot**2 * 0.01
-    vanna = ((df_band["call_oi"]*df_band["call_vega"]*df_band["call_delta"]).sum() +
-             (df_band["put_oi"] *df_band["put_vega"] *df_band["put_delta"]).sum()) / max(spot,1)
-    gt_ratio = abs(net_gamma)/max(abs(net_theta),1e-6)
-    momentum = ((df_band["call_oi_chg"]*df_band["call_delta"]).sum() + (df_band["put_oi_chg"]*df_band["put_delta"]).sum())
-    sv = (df_band["call_oi"]*df_band["call_vega"]).sum(); pv = (df_band["put_oi"]*df_band["put_vega"]).sum()
-    vega_skew = sv/pv if pv > 0 else 1.0
-    total_coi = df["call_oi"].sum(); total_poi = df["put_oi"].sum()
-    pcr = total_poi/total_coi if total_coi > 0 else 1.0
-    max_pain = compute_max_pain(df)
-    atm_row = df_band[df_band["strike"]==atm]
-    atm_iv  = float(((atm_row["call_iv"].values[0] if not atm_row.empty else 0) +
-                     (atm_row["put_iv"].values[0]  if not atm_row.empty else 0))/2)
-    support    = df_band.loc[df_band["put_oi"].idxmax(),  "strike"] if not df_band.empty else 0
-    resistance = df_band.loc[df_band["call_oi"].idxmax(), "strike"] if not df_band.empty else 0
-    wall_width = float(resistance - support) if resistance > support else float(step*4)
-    near_band  = df_band[df_band["strike"].between(atm-3*step, atm+3*step)]
-    tob        = df_band["call_oi"].sum() + df_band["put_oi"].sum()
-    near_oi_conc   = (near_band["call_oi"].sum()+near_band["put_oi"].sum())/tob if tob > 0 else 0.5
-    band_oichg     = abs(df_band["call_oi_chg"]).sum()+abs(df_band["put_oi_chg"]).sum()
-    near_oichg_conc= (abs(near_band["call_oi_chg"]).sum()+abs(near_band["put_oi_chg"]).sum())/band_oichg if band_oichg > 0 else 0.5
-    atm_pressure   = float(near_band["put_oi_chg"].sum() - near_band["call_oi_chg"].sum())
-    otm_puts = df_band[df_band["strike"] < atm-step]; otm_calls = df_band[df_band["strike"] > atm+step]
-    if len(otm_puts) >= 2 and len(otm_calls) >= 2:
-        put_slope  = float(np.polyfit(otm_puts["strike"],  otm_puts["put_iv"],   1)[0])
-        call_slope = float(np.polyfit(otm_calls["strike"], otm_calls["call_iv"], 1)[0])
-        skew_slope = round(put_slope - call_slope, 4)
-    else: skew_slope = 0.0
-    iv_rank    = compute_iv_rank(df_band)
-    gamma_flip = compute_gamma_flip(df_band, spot)
-    return {
-        "ev_ratio": round(ev_ratio,3), "net_delta": round(net_delta,0), "net_gamma": round(net_gamma,6),
-        "net_theta": round(net_theta,0), "gex": round(gex,0), "vanna": round(vanna,2),
-        "gt_ratio": round(gt_ratio,4), "momentum": round(momentum,0), "vega_skew": round(vega_skew,3),
-        "max_pain": round(max_pain,0), "pcr": round(pcr,2), "atm_iv": round(atm_iv,2), "atm": atm,
-        "support": support, "resistance": resistance, "wall_width": wall_width,
-        "near_oi_concentration": round(near_oi_conc,3), "near_oichg_concentration": round(near_oichg_conc,3),
-        "atm_pressure": round(atm_pressure,0), "skew_slope": round(skew_slope,4),
-        "iv_rank": iv_rank, "gamma_flip": gamma_flip,
-        "call_oi_total": int(total_coi), "put_oi_total": int(total_poi), "df_band": df_band,
-    }
-
-# ─────────────────────────────────────────────────────────────────────
-#  SCORING — upgraded to accept roll signals
+#  SCORING — futures signals only
 # ─────────────────────────────────────────────────────────────────────
 def _linear_score(value, lo, hi, weight, invert=False):
-    """METH-3 helper: linear interpolation between lo (score=0) and hi (score=weight).
+    """Linear interpolation between lo (score=0) and hi (score=weight).
     If invert=True, the polarity is flipped (high value → low score).
-    Values outside [lo, hi] are clipped. Eliminates the hard cliffs of the
-    old step-function scoring (e.g., net_delta 999 → 0 pts vs 1001 → 20 pts).
-    """
+    Values outside [lo, hi] are clipped."""
     if hi == lo: return weight / 2
     if invert:
-        # high value → 0, low value → weight
         v = max(lo, min(hi, value))
         return weight * (hi - v) / (hi - lo)
     else:
         v = max(lo, min(hi, value))
         return weight * (v - lo) / (hi - lo)
 
-def compute_score(m, roll=None):
-    """METH-3 fix: continuous (linear) scoring replaces step function.
-    Old: hard cliffs at fixed thresholds (e.g., net_delta 999 → 0 pts vs
-         1001 → +20 pts). A 0.2% change in net delta flipped 20 score points.
-    New: each metric contributes a linearly-interpolated score between its
-         bearish floor (0 pts) and bullish ceiling (max pts), using the
-         centralised THRESH thresholds. The composite is then clipped to [0, 100].
-    """
-    if not m: return 50.0
+def compute_futures_score(roll, roll_vel_z=None, symbol="GOLDM"):
+    """Futures-only composite score (0-100). Combines term-structure bias,
+    roll spread %, rollover velocity, rollover %, and rollover-velocity
+    z-score into a single directional score. Neutral baseline = 15,
+    ceiling = 100 when every futures signal is maximally bullish.
+    Thresholds are looked up per-symbol via get_thresh() (see
+    SYMBOL_THRESH_OVERRIDES) so GOLDPETAL can eventually get its own
+    calibration without touching GOLDM/SILVERM."""
+    if not roll: return 50.0
     score = 15  # neutral baseline
-    # EV ratio: 0.7 → 0 pts, 1.3 → 15 pts (linear)
-    score += _linear_score(m["ev_ratio"], 0.7, 1.3, 15)
-    # Net delta: -5000 → 0 pts, +5000 → 20 pts (linear)
-    score += _linear_score(m["net_delta"], -5000, 5000, 20)
-    # Momentum: -2000 → 0 pts, +2000 → 15 pts (linear)
-    score += _linear_score(m["momentum"], -2000, 2000, 15)
-    # Vega skew: 0.8 → 0 pts, 1.2 → 10 pts (linear)
-    score += _linear_score(m["vega_skew"], 0.8, 1.2, 10)
-    # Vanna: -10 → 0 pts, +10 → 10 pts (linear)
-    score += _linear_score(m["vanna"], -10, 10, 10)
-    if roll:
-        # Term structure bias: -2 → -6 pts, +2 → +6 pts (linear)
-        ts_bias = safe_num(roll.get("ts_bias", 0))
-        score += _linear_score(ts_bias, -2, 2, 6) - 3   # shift so 0 → 3 pts
-        # Carry anomaly: 0.5 → +4 pts (normal), 1.5 → -3 pts (big move priced)
-        # Use a downward slope: lower anomaly = more "normal" = more bullish for premium sellers
-        ca = safe_num(roll.get("carry_anomaly", 1.0))
-        score += _linear_score(ca, 1.5, 0.5, 7)  # invert polarity (low ca = good)
-        # Rollover velocity: 0.3 → -4 pts, 1.3 → +4 pts (linear)
-        rv = safe_num(roll.get("rollover_velocity", 0.8))
-        score += _linear_score(rv, 0.3, 1.3, 8) - 4   # shift so 0.3 → 0 pts, 1.3 → 8 pts
+    tsb = safe_num(roll.get("ts_bias", 0))
+    score += _linear_score(tsb, -2, 2, 25)                                          # term structure: 0..25
+    rsp = safe_num(roll.get("roll_spread_pct", 0))
+    score += _linear_score(rsp, -0.3, 0.3, 20)                                       # roll spread %: 0..20
+    rv  = safe_num(roll.get("rollover_velocity", get_thresh(symbol, "ROLL_VEL_NORMAL")))
+    score += _linear_score(rv, get_thresh(symbol, "ROLL_VEL_LIQUID_HARD"), get_thresh(symbol, "ROLL_VEL_CONVICTION"), 20)  # rollover velocity: 0..20
+    rp  = safe_num(roll.get("rollover_pct", get_thresh(symbol, "ROLLOVER_PCT_NORMAL")))
+    score += _linear_score(rp, 0, get_thresh(symbol, "ROLLOVER_PCT_ADVANCED"), 10)   # rollover %: 0..10
+    if roll_vel_z is not None:
+        score += _linear_score(safe_num(roll_vel_z, 0), get_thresh(symbol, "ZSCORE_BEAR")*2, get_thresh(symbol, "ZSCORE_BULL")*2, 10)  # roll vel z: 0..10
+    else:
+        score += 5   # half credit while the z-score baseline is still building
     return round(min(max(score, 0), 100), 1)
 
-def strategy_recommendation(score, m, symbol="GOLDM"):
-    """METH-9 fix: validate legs and fall back if inverted.
-    Old: built legs like `Buy {atm} CE | Sell {resistance} CE` without
-         checking that resistance > atm. If call OI peaked below spot
-         (resistance < atm), this became a bear call spread labelled as
-         a bull call spread.
-    New: validate each leg's strike ordering; if legs are inverted, fall
-         back to a wide strangle structure that doesn't depend on the
-         inverted support/resistance readings.
-    """
-    support = m.get("support",0); resistance = m.get("resistance",0)
-    atm     = m.get("atm",0)
-    step    = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-    if   score >= 85: name, color = "Long Call / Bull Call Spread", "#00C853"
-    elif score >= 70: name, color = "Bull Call Spread",             "#69F0AE"
-    elif score >= 55: name, color = "Bull Put Spread (High Prob)",  "#B2FF59"
-    elif score >= 45: name, color = "Iron Condor",                  "#FFD600"
-    elif score >= 31: name, color = "Bear Call Spread",             "#FF6D00"
-    elif score >= 16: name, color = "Bear Put Spread",              "#F44336"
-    else:             name, color = "Long Put",                     "#B71C1C"
-
-    # Default legs per score band
-    if   score >= 85: legs = f"Buy {int(atm)} CE  |  Sell {int(resistance)} CE"
-    elif score >= 70: legs = f"Buy {int(atm)} CE  |  Sell {int(atm+2*step)} CE"
-    elif score >= 55: legs = f"Sell {int(support+step)} PE  |  Buy {int(support-step)} PE"
-    elif score >= 45: legs = (f"Sell {int(support+step)} PE / Buy {int(support-step)} PE  +  "
-                               f"Sell {int(resistance-step)} CE / Buy {int(resistance+step)} CE")
-    elif score >= 31: legs = f"Sell {int(atm)} CE  |  Buy {int(atm+2*step)} CE"
-    elif score >= 16: legs = f"Buy {int(atm)} PE  |  Sell {int(atm-2*step)} PE"
-    else:             legs = f"Buy {int(support-step)} PE"
-
-    # METH-9: validate legs — if support/resistance are inverted relative
-    # to the intended strategy direction, fall back to a wide strangle
-    # using ATM ± 3 steps (doesn't depend on potentially-corrupted S/R).
-    legs_inverted = False
-    if score >= 55 and support > 0 and resistance > 0 and support >= resistance:
-        # For bullish strategies, support must be below resistance.
-        legs_inverted = True
-    if score >= 85 and resistance > 0 and resistance <= atm:
-        # Bull call spread needs resistance > atm
-        legs_inverted = True
-    if score <= 45 and support > 0 and resistance > 0 and support >= resistance:
-        # For bearish strategies, support should still be below resistance
-        # (otherwise the walls are confused and the trade is unreliable).
-        legs_inverted = True
-
-    if legs_inverted:
-        # Fall back: wide strangle centred on ATM, doesn't depend on S/R
-        if score >= 55:
-            # Bullish bias → bullish-flavoured fallback (long call spread)
-            legs = f"Buy {int(atm)} CE  |  Sell {int(atm+3*step)} CE  (fallback: S/R inverted)"
-        elif score <= 45:
-            # Bearish bias → bearish-flavoured fallback (long put spread)
-            legs = f"Buy {int(atm)} PE  |  Sell {int(atm-3*step)} PE  (fallback: S/R inverted)"
-        else:
-            # Neutral → wide iron condor fallback
-            legs = (f"Sell {int(atm-3*step)} PE / Buy {int(atm-4*step)} PE  +  "
-                    f"Sell {int(atm+3*step)} CE / Buy {int(atm+4*step)} CE  (fallback: S/R inverted)")
+def futures_recommendation(score, roll, symbol="GOLDM"):
+    """Futures-only market mode + directional recommendation (no option legs)."""
+    near_tsym = (roll or {}).get("near_tsym", symbol)
+    next_tsym = (roll or {}).get("next_tsym", symbol)
+    if   score >= 85: name, color, action = "Strong Long Futures",           "#00C853", f"BUY {near_tsym} — ride the trend, trail stop below near-month support"
+    elif score >= 70: name, color, action = "Long Futures / Bullish Carry",  "#69F0AE", f"Accumulate {near_tsym} on dips; roll into {next_tsym} as expiry nears"
+    elif score >= 55: name, color, action = "Mildly Long / Accumulate",      "#B2FF59", f"Small long in {near_tsym}; wait for confirmation before adding"
+    elif score >= 45: name, color, action = "Neutral / Range-Bound",         "#FFD600", f"No strong edge — range-trade {near_tsym} or stay flat"
+    elif score >= 31: name, color, action = "Mildly Short / Reduce",         "#FF6D00", f"Trim longs in {near_tsym}; avoid fresh buying"
+    elif score >= 16: name, color, action = "Short Futures / Bearish Carry", "#F44336", f"Sell {near_tsym} on rallies; watch backwardation for squeeze risk"
+    else:             name, color, action = "Strong Short Futures",         "#B71C1C", f"SELL {near_tsym} — delivery-pressure / backwardation squeeze risk"
 
     if   score >= 55: mode, mc = "TREND MODE — Bullish", "#00E676"
     elif score >= 45: mode, mc = "NEUTRAL / RANGE",      "#FFD740"
-    else:             mode, mc = "TREND MODE — Bearish",  "#FF5252"
-    return {"name": name, "legs": legs, "color": color, "market_mode": mode, "mode_color": mc}
+    else:             mode, mc = "TREND MODE — Bearish", "#FF5252"
+    return {"name": name, "action": action, "color": color, "market_mode": mode, "mode_color": mc}
 
 # ─────────────────────────────────────────────────────────────────────
-#  OI VELOCITY
-# ─────────────────────────────────────────────────────────────────────
-def compute_oi_velocity(history, symbol="GOLDM"):
-    """BUG-6 fix: do NOT fabricate OI from net_delta/momentum when API returns zero.
-    Old: if both call_oi and put_oi totals were zero, reconstruct synthetic values
-         from net_delta and momentum. But momentum itself is derived from OI changes,
-         so this creates a feedback loop with no informational value — the resulting
-         'velocity' is meaningless noise dressed up as a metric.
-    New: explicitly mark data as unavailable, return zeroed velocity + alert text
-         telling the user the API isn't returning OI.
-    """
-    sym_history = _extract_sym_history(history, symbol)
-    if len(sym_history) < 3:
-        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
-                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE","alert_text":"Collecting data…","n_ticks":0}
-    call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history], dtype=float)
-    put_oi  = np.array([safe_num(x.get("put_oi_total", 0)) for x in sym_history], dtype=float)
-    # BUG-6: stop fabricating OI — if API returned zero, surface "data unavailable"
-    if call_oi.max() == 0 and put_oi.max() == 0:
-        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
-                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE",
-                "alert_text":"⚠ OI data unavailable from API — velocity not computed.","n_ticks":len(sym_history)}
-    c_vel = np.diff(call_oi); p_vel = np.diff(put_oi)
-    if len(c_vel) < 2:
-        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
-                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE","alert_text":"Collecting data…","n_ticks":len(sym_history)}
-    c_accel = float(c_vel[-1]-c_vel[-2]); p_accel = float(p_vel[-1]-p_vel[-2])
-    window  = min(10, len(c_vel))
-    c_vel_z = _zscore(c_vel, window); p_vel_z = _zscore(p_vel, window)
-    max_z   = max(abs(c_vel_z), abs(p_vel_z))
-    if max_z >= THRESH.OI_VEL_SURGE:
-        side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
-        direction = "surge" if (c_vel_z if side=="CALL" else p_vel_z)>0 else "unwind"
-        alert_level = "DANGER"; alert_text = f"⚡ {side} OI {direction} detected — velocity {max_z:.1f}σ above norm."
-    elif max_z >= THRESH.OI_VEL_WATCH:
-        side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
-        alert_level = "WATCH"; alert_text = f"⚠ {side} OI velocity elevated ({max_z:.1f}σ). Monitor closely."
-    else:
-        alert_level = "NONE"; alert_text = "OI velocity within normal range."
-    return {"call_oi_velocity":float(c_vel[-1]),"put_oi_velocity":float(p_vel[-1]),
-            "call_oi_accel":c_accel,"put_oi_accel":p_accel,
-            "call_vel_zscore":round(c_vel_z,2),"put_vel_zscore":round(p_vel_z,2),
-            "alert_level":alert_level,"alert_text":alert_text,"n_ticks":len(sym_history)}
-
-# ─────────────────────────────────────────────────────────────────────
-#  OI REGIME + COMBINED BIAS
-# ─────────────────────────────────────────────────────────────────────
-def _bucket_oi_15min(sym_history):
-    """BUG-6 fix: same fabrication removed here. If OI totals are zero,
-    return empty buckets so the regime detector shows 'collecting data'."""
-    if len(sym_history) < 3: return [], [], []
-    call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history], dtype=float)
-    put_oi  = np.array([safe_num(x.get("put_oi_total", 0)) for x in sym_history], dtype=float)
-    # BUG-6: stop fabricating — return empty buckets if API gave no OI
-    if call_oi.max()==0 and put_oi.max()==0:
-        return [], [], []
-    ts = [x.get("ts","") for x in sym_history]; c_vel = np.diff(call_oi); p_vel = np.diff(put_oi); ts_v = ts[1:]
-    bc, bp = {}, {}
-    for i, t in enumerate(ts_v):
-        try:
-            p  = t.split("T")[-1].split(":"); hh, mm = int(p[0]), int(p[1]); label = f"{hh:02d}:{(mm//15)*15:02d}"
-        except Exception: label = t
-        bc[label] = bc.get(label,0.0)+float(c_vel[i]); bp[label] = bp.get(label,0.0)+float(p_vel[i])
-    labels = sorted(bc.keys())
-    return labels, [bc[l] for l in labels], [bp.get(l,0.0) for l in labels]
-
-def _oi_regime_info(c_bkt, p_bkt):
-    if not c_bkt or not p_bkt:
-        return {"label":"Collecting OI data for regime detection…","sub":"","bg":CARD,"fg":MUTED,"border":MUTED}
-    c_arr = np.array(c_bkt,dtype=float); p_arr = np.array(p_bkt,dtype=float)
-    c_std = float(c_arr.std()) if c_arr.std()>1e-9 else 1.0; p_std = float(p_arr.std()) if p_arr.std()>1e-9 else 1.0
-    rc = list(c_arr[-3:]); rp = list(p_arr[-3:])
-    avg_c = abs(float(np.mean(rc))) if rc else 0.0; avg_p = abs(float(np.mean(rp))) if rp else 0.0
-    buyer  = (avg_c > 1.0*c_std) or (avg_p > 1.0*p_std)
-    seller = (avg_c <= 0.8*c_std) and (avg_p <= 0.8*p_std)
-    if buyer and not seller:
-        return {"label":"OPTION BUYER'S REGIME","sub":"OI velocity elevated — directional participants active. Premium is expensive. Favour directional plays.","bg":"#FFFBEB","fg":"#D97706","border":"#D97706"}
-    elif seller:
-        return {"label":"OPTION SELLER'S REGIME","sub":"OI velocity subdued — writers in control. Range-bound / premium decay favoured. Sell spreads or iron condors.","bg":"#F0FDF4","fg":"#059669","border":"#059669"}
-    else:
-        return {"label":"TRANSITIONAL REGIME","sub":"Mixed OI signals — neither buyers nor sellers clearly dominant. Wait for clarity.","bg":"#EFF6FF","fg":"#0891B2","border":"#0891B2"}
-
-def _combined_bias_info(c_bkt, p_bkt):
-    if not c_bkt or not p_bkt: return None
-    c_arr = np.array(c_bkt,dtype=float); p_arr = np.array(p_bkt,dtype=float)
-    mc = float(c_arr.mean()); sc = float(c_arr.std()) if c_arr.std()>1e-9 else 1.0
-    mp = float(p_arr.mean()); sp = float(p_arr.std()) if p_arr.std()>1e-9 else 1.0
-    cc = c_arr[:-1] if len(c_arr)>=2 else c_arr; cp = p_arr[:-1] if len(p_arr)>=2 else p_arr
-    sc_v = float(np.mean(cc[-2:])) if len(cc)>=2 else float(np.mean(cc)) if len(cc) else 0.0
-    sp_v = float(np.mean(cp[-2:])) if len(cp)>=2 else float(np.mean(cp)) if len(cp) else 0.0
-    c_z = (sc_v-mc)/sc; p_z = (sp_v-mp)/sp
-    STRONG, WEAK = 0.8, 0.3
-    c_up = c_z>STRONG; c_down = c_z<-STRONG; c_flat = abs(c_z)<WEAK
-    p_up = p_z>STRONG; p_down = p_z<-STRONG; p_flat = abs(p_z)<WEAK
-    if   c_up and p_up:     bias, bc = "PINNED — Range / Max-Pain Bias",        BLUE
-    elif c_up and p_down:   bias, bc = "BULLISH — Upside Bias from Writers",     GREEN
-    elif c_down and p_up:   bias, bc = "BEARISH — Downside Bias from Writers",   RED
-    elif c_down and p_down: bias, bc = "EXPANSION — Breakout / Breakdown Risk",  "#9333EA"
-    elif c_up and p_flat:   bias, bc = "MILDLY BEARISH — Resistance Reinforcing",AMBER
-    elif p_up and c_flat:   bias, bc = "MILDLY BULLISH — Support Reinforcing",   "#10B981"
-    else:                   bias, bc = "NEUTRAL — No Clear OI Signal",           MUTED
-    return {"bias": bias, "bc": bc, "c_z": c_z, "p_z": p_z}
-
-# ─────────────────────────────────────────────────────────────────────
-#  INTRADAY OI RECORDER — with rollover velocity
+#  INTRADAY OI RECORDER — with rollover velocity (UNCHANGED FROM v5)
 # ─────────────────────────────────────────────────────────────────────
 def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
-    """BUG-3 fix: stable denominator with OI-relative floor, None for low-activity periods.
+    """Stable denominator with OI-relative floor, None for low-activity periods.
 
-    Old: v = d_next / |d_near|  if |d_near| > 10 else prev   (arbitrary threshold, silent reuse)
-    Issues:
-      - Threshold of 10 lots is arbitrary and not scaled to symbol's typical OI.
-      - When |d_near| = 11 and d_next = 1500, velocity = 136 — wild outlier that
-        pollutes the z-score mean/std for the rest of the day.
-      - The "else reuse previous" branch silently hides low-activity periods,
-        creating artificial flat spots in the chart.
-
-    New: v = d_next / max(|d_near|, 0.5% × near_oi)
-      - Floor scales with near OI (5 lots minimum) — no more arbitrary threshold.
+    v = d_next / max(|d_near|, 0.5% × near_oi)
+      - Floor scales with near OI (5 lots minimum).
       - Sign comes from d_next only: positive = next OI growing (bullish rollover),
-        negative = next OI shrinking (bearish liquidation). This preserves the
-        original interpretation in the dashboard (≥1.3 = conviction, <0.3 = liquidation).
+        negative = next OI shrinking (bearish liquidation).
       - When BOTH d_near and d_next are below floor, mark velocity as None so the
         z-score baseline excludes the tick instead of inheriting a stale value.
       - Clip to ±10 to prevent extreme outliers polluting the z-score baseline.
+
+    ts is stored as full 'YYYY-MM-DD HH:MM' (not bare 'HH:MM') so that
+    persisting oi_history to disk across a restart can't accidentally
+    splice today's ticks onto a same-minute tick from a previous day.
     """
     if not roll: return oi_history
-    ts     = strftime_ist("%H:%M")
+    ts     = strftime_ist("%Y-%m-%d %H:%M")
     noi    = roll.get("near_oi", 0); xoi = roll.get("next_oi", 0)
     entry  = {"ts": ts, "near_oi": noi, "next_oi": xoi, "total_oi": noi + xoi}
     hist   = oi_history.setdefault(symbol, [])
@@ -1088,13 +669,8 @@ def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
             # Too quiet to measure — mark as None so z-score skips it
             entry["rollover_velocity"] = None
         else:
-            # Positive denominator (sign comes from d_next only).
-            # This preserves the original interpretation:
-            #   d_next > 0 → velocity > 0 → bullish (next OI growing)
-            #   d_next < 0 → velocity < 0 → bearish (next OI shrinking)
             denom = max(abs(d_near), floor)
             v = d_next / denom if denom != 0 else 0.0
-            # Clip to ±10 to prevent extreme outliers polluting z-score baseline
             entry["rollover_velocity"] = round(max(-10.0, min(10.0, v)), 3)
     else:
         entry["rollover_velocity"] = None  # first tick — no baseline yet
@@ -1102,205 +678,40 @@ def record_intraday_oi(symbol: str, roll: dict, oi_history: dict):
     else: hist.append(entry)
     if len(hist) > THRESH.HISTORY_MAX_TICKS: oi_history[symbol] = hist[-THRESH.HISTORY_MAX_TICKS:]
     return oi_history
-# ─────────────────────────────────────────────────────────────────────
-#  NEW v4 BIAS ENGINES
-# ─────────────────────────────────────────────────────────────────────
-def compute_wing_excess(df_band, atm, atm_iv, symbol="GOLDM", expiry=None):
-    """METH-6 fix: scale wing-excess window by atm_iv × √T (volatility-adjusted moneyness),
-    not by fixed step multiples.
-
-    Old: used a fixed window of (atm-6*step, atm-2*step) for puts and
-         (atm+2*step, atm+6*step) for calls. For GOLDM (step=100) that's
-         ₹200-₹600 — reasonable. But for SILVERM (step=1000) it's ₹2 000-₹6 000,
-         which is far too wide in moneyness terms (SILVERM vol ≈ 25-30% vs
-         GOLDM ≈ 12-15%). The smile wings were getting sampled at the wrong
-         moneyness distance for each commodity.
-
-    New: define wing distance as a multiple of (atm_iv/100) × √T × spot —
-         i.e., ±1 σ to ±2 σ moves (BS expected-move scaling). Falls back to
-         the old step-based window if atm_iv/spot/T are unavailable.
-    """
-    if df_band.empty or atm_iv <= 0: return None, None
-    step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-
-    # Compute T (years to expiry)
-    T = None
-    if expiry:
-        try:
-            T = max((datetime.strptime(str(expiry)[:10],"%Y-%m-%d").date() - date.today()).days, 1) / 365.0
-        except Exception:
-            T = None
-    if T is None: T = 10 / 365.0  # default 10 days
-
-    # Compute volatility-adjusted wing distances
-    one_sigma = (atm_iv / 100.0) * np.sqrt(T) * atm   # price distance for 1σ move
-    # Sample wings from 1σ to 2σ OTM — typically the part of the smile that
-    # captures the "fear" premium without dipping into near-zero-IV illiquid tails
-    wing_inner = max(one_sigma * 1.0, 2 * step)   # at least 2 strikes
-    wing_outer = max(one_sigma * 2.0, 4 * step)   # at least 4 strikes
-
-    piv = df_band.loc[df_band["strike"].between(atm - wing_outer, atm - wing_inner) & (df_band["put_iv"] > 0.5),  "put_iv"]
-    civ = df_band.loc[df_band["strike"].between(atm + wing_inner, atm + wing_outer) & (df_band["call_iv"] > 0.5), "call_iv"]
-    if len(piv) < 2 or len(civ) < 2:
-        # Fall back to old step-based window if vol-adjusted window has too few strikes
-        piv = df_band.loc[df_band["strike"].between(atm - 6*step, atm - 2*step) & (df_band["put_iv"] > 0.5),  "put_iv"]
-        civ = df_band.loc[df_band["strike"].between(atm + 2*step, atm + 6*step) & (df_band["call_iv"] > 0.5), "call_iv"]
-    if len(piv) < 2 or len(civ) < 2: return None, None
-    return round(float(piv.mean()) - atm_iv, 2), round(float(civ.mean()) - atm_iv, 2)
-
-def classify_iv_smile_scenario(df_band, m, spot, symbol="GOLDM", iv_smile_history=None):
-    """12-scenario IV smile classifier — commodity-adapted for GOLDM/SILVERM step sizes."""
-    if df_band.empty or spot <= 0:
-        return {"scenario":"Insufficient data","color":MUTED,"desc":"Need option chain data","put_wing_excess":0,"call_wing_excess":0,"trend_put":0,"trend_call":0}
-    atm    = m.get("atm", 0); atm_iv = m.get("atm_iv", 0)
-    if atm_iv <= 0:
-        return {"scenario":"No ATM IV","color":MUTED,"desc":"ATM IV not available","put_wing_excess":0,"call_wing_excess":0,"trend_put":0,"trend_call":0}
-    pe, ce = compute_wing_excess(df_band, atm, atm_iv, symbol)
-    if pe is None:
-        return {"scenario":"Insufficient OTM data","color":MUTED,"desc":"Need more OTM strikes","put_wing_excess":0,"call_wing_excess":0,"trend_put":0,"trend_call":0}
-    trend_put = trend_call = 0.0
-    if iv_smile_history and len(iv_smile_history) >= 3:
-        recent = iv_smile_history[-5:]
-        trend_put  = float(np.mean([h.get("put_wing_excess",  0) for h in recent]))
-        trend_call = float(np.mean([h.get("call_wing_excess", 0) for h in recent]))
-    HIGH = atm_iv * 0.25; MED = atm_iv * 0.10
-    if pe > HIGH and ce > HIGH:
-        if abs(pe-ce) < MED:   scenario,color,desc = "SYMMETRIC WIDE / VOLATILITY BID",    PINK,  "Both wings elevated — large move priced in either direction. Favour long straddle / long gamma."
-        elif pe > ce:           scenario,color,desc = "INVERTED SMILE / PUT SKEW HEAVY",     RED,   "Put wing dominates — crash fear / institutional hedging active. Sell call spreads."
-        else:                   scenario,color,desc = "CALL SKEW DOMINANT",                  GREEN, "Call wing dominates — breakout speculation / short squeeze risk."
-    elif pe > HIGH and ce < MED:
-        if trend_put > MED:     scenario,color,desc = "CRASH FEAR / PANIC HEDGE",            RED,   "OTM put IV persistently elevated — strong fear; do not sell puts."
-        else:                   scenario,color,desc = "SMIRK / STRUCTURAL PUT BUYER",        AMBER, "Moderate put skew, low call wing — structural hedgers active; mildly bearish."
-    elif ce > HIGH and pe < MED:
-        if ce > HIGH*1.5:       scenario,color,desc = "STRONG CALL SKEW / BREAKOUT BET",    "#00E676","Call wing very elevated — big upside being priced. Favour long calls / call spread."
-        else:                   scenario,color,desc = "CALL SKEW / MILD UPSIDE BID",         "#69F0AE","Call wing moderately elevated — mild bullish speculation."
-    elif pe < -MED and ce < -MED:
-        scenario,color,desc = "IV CRUSH / POST-EVENT",    CYAN,  "Both wings below ATM — options cheap after event. Favour long gamma."
-    elif abs(pe) < MED and abs(ce) < MED:
-        if atm_iv > 25:         scenario,color,desc = "NORMAL / ELEVATED ATM IV",            AMBER, "Flat smile, high ATM IV — premium selling conditions. Iron condor / short strangle."
-        else:                   scenario,color,desc = "NORMAL / LOW IV",                     GREEN, "Flat smile, low IV — options cheap; favour long gamma or long options."
-    elif pe > MED and ce < MED:
-        if trend_put > trend_call: scenario,color,desc = "MILD PUT SKEW / BUILDING",         AMBER, "Put wing slowly building — cautious market; avoid naked puts."
-        else:                   scenario,color,desc = "COMPRESSED / COILED SPRING",          CYAN,  "Put wing present but call wing flat — tension building; watch for breakout."
-    else:
-        scenario,color,desc = "TRANSITIONAL / MIXED SIGNALS", MUTED, "Unclear smile shape — market in transition; wait for confirmation."
-    return {"scenario":scenario,"color":color,"desc":desc,
-            "put_wing_excess":pe,"call_wing_excess":ce,"trend_put":round(trend_put,2),"trend_call":round(trend_call,2)}
-
-def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamma_flip, step,
-                          symbol="GOLDM"):
-    """METH-7 fix: symbol-aware thresholds.
-
-    Old: hard-coded `abs(gex) > 1e8` applied to both GOLDM and SILVERM.
-         But GOLDM typical OI ≈ 18 000 lots × ~₹95 000 spot → notional ~$200M,
-         so GEX in the 1e8 range is 'normal large'. SILVERM typical OI ≈ 4 500
-         lots × ~₹96 000 spot → notional ~$50M, so 1e8 is 'huge'.
-         Same threshold meant different things for each commodity.
-
-    New: use symbol-specific notional scaling. The `large_gex` threshold is
-         set relative to a typical OI×spot×0.01 baseline per symbol.
-    """
-    if not step or step <= 0: step = 100
-    # METH-7: symbol-aware GEX threshold
-    sym_gex_threshold = 1e8 if symbol == "GOLDM" else (2e7 if symbol == "SILVERM" else 1e8)
-    flip_dist   = abs(spot - gamma_flip) if gamma_flip is not None else 9999
-    near_flip   = flip_dist < max(3.0*step, step*3)
-    narrow_wall = wall_width < 10*step
-    mod_wall    = wall_width < 20*step
-    high_iv     = iv_rank > 70
-    positive    = gex > 0
-    large_gex   = abs(gex) > sym_gex_threshold
-    if near_flip:
-        return "FLIP ZONE / UNSTABLE", "Price near gamma flip — dealer hedging switches from stabilising to amplifying. High volatility risk.", "HIGH VOL RISK", RED
-    elif positive and large_gex and narrow_wall:
-        return "PINNED / RANGE", "Strong positive GEX + tight walls — dealers pin price; expect mean-reversion. Sell premium.", "LOW VOL / PIN", GREEN
-    elif positive and mod_wall:
-        return "RANGE / PIN", "Positive GEX with moderate range — price likely to oscillate. Range trades favoured.", "RANGE BOUND", CYAN
-    elif not positive and large_gex and (abs(momentum) > 500 or high_iv):
-        return "TREND / EXPANSION", "Negative GEX + high momentum or fear — dealers amplify moves. Favour directional plays.", "TREND / HIGH VOL", AMBER
-    else:
-        return "TRANSITION", "Mixed gamma signals — market changing regimes. Wait for confirmation before trading.", "NEUTRAL", MUTED
-
-def compute_carry_anomaly(roll: dict, atm_iv: float) -> float:
-    """BUG-5 fix: actual roll spread vs IV-implied carry over the *actual*
-    near→next expiry window (not a fixed weekly horizon).
-
-    Old (wrong): expected = (atm_iv/100) * near_ltp / sqrt(52)
-      — divides by sqrt(52) assuming a 1-week horizon, but the roll spread
-        actually spans ~30 days (near → next expiry). This massively over-
-        states the "expected" carry, so the anomaly ratio almost always > 1
-        and the ≥1.5 threshold triggers too easily.
-
-    New (correct): expected_carry = near_ltp * (atm_iv/100) * sqrt(days_to_next / 365)
-      — uses the actual number of days between near and next expiry, scaled
-        by sqrt(T) as in BS-style expected move. Returns ratio
-        |roll_spread| / expected_carry; > THRESH.CARRY_ANOM_BIG_MOVE (1.5)
-        means futures are pricing a larger move than IV implies.
-
-    Also switched to log-return formulation for robustness against
-    extremely small near_ltp values.
-    """
-    if not roll or atm_iv <= 0: return 1.0
-    near_ltp = roll.get("near_ltp", 0); roll_spread = roll.get("roll_spread", 0)
-    if near_ltp <= 0: return 1.0
-
-    # Get days between near and next expiry
-    days_to_next = 30  # sensible default if expiry dates unavailable
-    try:
-        ne = roll.get("near_expiry"); xe = roll.get("next_expiry")
-        if ne and xe:
-            nd = datetime.strptime(ne, "%Y-%m-%d").date()
-            xd = datetime.strptime(xe, "%Y-%m-%d").date()
-            days_to_next = max((xd - nd).days, 1)
-    except Exception:
-        pass
-
-    # Expected absolute carry over near→next window, in price units.
-    # Uses sqrt(T) scaling (BS expected-move convention).
-    T = days_to_next / 365.0
-    expected_carry = near_ltp * (atm_iv / 100.0) * np.sqrt(T)
-    if expected_carry <= 0: return 1.0
-
-    return round(abs(roll_spread) / expected_carry, 2)
 
 def compute_rollover_velocity_zscore(oi_history, symbol):
-    """BUG-2 + BUG-7 + METH-4 fix.
-    Old: z = (last - mean(all_ticks)) / std(all_ticks)   (whole-day baseline; dilutes early spikes)
-         returns 0.0 / "Collecting data…" when len < 3 (misleading — looks like exactly-average)
-    New: z = (last - mean(last N ticks)) / std(last N ticks)   (rolling window)
-         returns None / "Collecting data…" when insufficient — UI renders "—"
-    """
+    """Rolling-window z-score of rollover velocity.
+    z = (last - mean(last N ticks)) / std(last N ticks)
+    Returns None / "Collecting data…" when insufficient — UI renders "—".
+    Bucket thresholds are symbol-aware via get_thresh()."""
     hist = oi_history.get(symbol, [])
-    # Filter out None entries (low-activity periods) and convert to float
     rvs_all = [h.get("rollover_velocity") for h in hist if h.get("rollover_velocity") is not None]
     if len(rvs_all) < THRESH.ROLL_VEL_ZSCORE_MIN:
         return None, "Collecting data…", MUTED
 
-    # Use rolling window (last N samples) for the baseline
     window = min(THRESH.ROLL_VEL_ZSCORE_WINDOW, len(rvs_all))
     arr = np.array(rvs_all[-window:], dtype=float)
     std = float(arr.std()) if arr.std() > 1e-9 else 1.0
     z = float((arr[-1] - arr.mean()) / std)
 
-    # Interpret the latest raw velocity (signed — may now be negative after BUG-3 fix)
     latest = float(arr[-1])
-    if   latest >= THRESH.ROLL_VEL_CONVICTION:
+    if   latest >= get_thresh(symbol, "ROLL_VEL_CONVICTION"):
         interp, color = f"Conviction roll — {latest:.2f} (longs adding)", GREEN
-    elif latest >= THRESH.ROLL_VEL_NORMAL:
+    elif latest >= get_thresh(symbol, "ROLL_VEL_NORMAL"):
         interp, color = f"Normal roll — {latest:.2f}", CYAN
-    elif latest >= THRESH.ROLL_VEL_SLOW:
+    elif latest >= get_thresh(symbol, "ROLL_VEL_SLOW"):
         interp, color = f"Slow roll — {latest:.2f} (caution)", AMBER
-    elif latest >= THRESH.ROLL_VEL_LIQUID_MILD:
+    elif latest >= get_thresh(symbol, "ROLL_VEL_LIQUID_MILD"):
         interp, color = f"Mild liquidation — {latest:.2f}", "#FF6D00"
     else:
         interp, color = f"Hard liquidation — {latest:.2f} (bearish unwind)", RED
     return round(z, 2), interp, color
 
 # ─────────────────────────────────────────────────────────────────────
-#  COMBINED MARKET BIAS — Options + Futures unified decision matrix
-#  v4-surgical: added to satisfy "combined Market Bias decision matrix"
-#  requirement. Reads existing m / roll / iv_smile_result / g_regime /
-#  carry_anomaly / roll_vel_z signals — does NOT mutate them.
+#  FUTURES BIAS DECISION MATRIX
+#  Aggregates the futures signals above into a single decision matrix.
+#  (Options-based signals and Carry Anomaly — which required option-
+#  implied ATM IV — have been removed; this reads futures-only inputs.)
 # ─────────────────────────────────────────────────────────────────────
 def _bias_tag(bias, strength, color):
     """Render a small colour-coded chip for inline bias explanations."""
@@ -1312,146 +723,62 @@ def _bias_tag(bias, strength, color):
             f"border-radius:5px;padding:1px 7px;font-size:10px;font-weight:700;"
             f"letter-spacing:0.3px;white-space:nowrap;'>{label}</span>")
 
-def compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
-                                 carry_anomaly, roll_vel_z, score):
-    """Aggregate options + futures signals into a single decision matrix.
-
-    Each signal is scored as BULLISH / BEARISH / SIDEWAYS / TREND with an
-    optional strength qualifier. The net directional score decides the
-    final verdict that is displayed at the top of the dashboard.
-    """
+def compute_futures_market_bias(roll, roll_vel_z, score, symbol="GOLDM"):
+    """Aggregate futures signals into a single decision matrix.
+    Thresholds are looked up per-symbol via get_thresh()."""
     signals = []
 
-    def _add(name, value, bias, strength, color, source):
+    def _add(name, value, bias, strength, color):
         signals.append({"name": name, "value": value, "bias": bias,
-                        "strength": strength, "color": color, "source": source})
+                        "strength": strength, "color": color})
 
-    # ── OPTIONS SIGNALS ──────────────────────────────────────────────
-    nd = safe_num(m.get("net_delta", 0))
-    if   nd >=  5000: _add("Net Delta", f"{int(nd):,}",       "BULLISH", "Strong", GREEN,  "Options")
-    elif nd >=  1000: _add("Net Delta", f"{int(nd):,}",       "BULLISH", "Mild",   "#69F0AE", "Options")
-    elif nd <= -5000: _add("Net Delta", f"{int(nd):,}",       "BEARISH", "Strong", RED,    "Options")
-    elif nd <= -1000: _add("Net Delta", f"{int(nd):,}",       "BEARISH", "Mild",   "#FF6D00", "Options")
-    else:             _add("Net Delta", f"{int(nd):,}",       "SIDEWAYS","—",      MUTED,   "Options")
-
-    mom = safe_num(m.get("momentum", 0))
-    if   mom >=  2000: _add("Momentum", f"{int(mom):,}",      "BULLISH", "Strong", GREEN,  "Options")
-    elif mom >=   500: _add("Momentum", f"{int(mom):,}",      "BULLISH", "Mild",   "#69F0AE", "Options")
-    elif mom <= -2000: _add("Momentum", f"{int(mom):,}",      "BEARISH", "Strong", RED,    "Options")
-    elif mom <=  -500: _add("Momentum", f"{int(mom):,}",      "BEARISH", "Mild",   "#FF6D00", "Options")
-    else:              _add("Momentum", f"{int(mom):,}",      "SIDEWAYS","—",      MUTED,   "Options")
-
-    ev = safe_num(m.get("ev_ratio", 1.0))
-    if   ev >= 1.3: _add("EV Ratio", f"{ev:.2f}", "BULLISH", "Strong", GREEN,    "Options")
-    elif ev >= 1.1: _add("EV Ratio", f"{ev:.2f}", "BULLISH", "Mild",   "#69F0AE", "Options")
-    elif ev <= 0.7: _add("EV Ratio", f"{ev:.2f}", "BEARISH", "Strong", RED,      "Options")
-    elif ev <= 0.9: _add("EV Ratio", f"{ev:.2f}", "BEARISH", "Mild",   "#FF6D00", "Options")
-    else:           _add("EV Ratio", f"{ev:.2f}", "SIDEWAYS","—",      MUTED,     "Options")
-
-    pcr = safe_num(m.get("pcr", 1.0))
-    if   pcr >= 1.3: _add("PCR", f"{pcr:.2f}", "BULLISH", "Strong", GREEN,    "Options")
-    elif pcr >= 1.0: _add("PCR", f"{pcr:.2f}", "BULLISH", "Mild",   "#69F0AE", "Options")
-    elif pcr <= 0.5: _add("PCR", f"{pcr:.2f}", "BEARISH", "Strong", RED,      "Options")
-    elif pcr <= 0.7: _add("PCR", f"{pcr:.2f}", "BEARISH", "Mild",   "#FF6D00", "Options")
-    else:            _add("PCR", f"{pcr:.2f}", "SIDEWAYS","—",      MUTED,     "Options")
-
-    gex = safe_num(m.get("gex", 0))
-    if   gex >  1e8: _add("GEX", f"{gex:,.0f}", "SIDEWAYS","Pinned",  BLUE,    "Options")
-    elif gex >  0:   _add("GEX", f"{gex:,.0f}", "SIDEWAYS","Stable",  CYAN,    "Options")
-    elif gex < -1e8: _add("GEX", f"{gex:,.0f}", "TREND",   "Volatile",AMBER,   "Options")
-    else:            _add("GEX", f"{gex:,.0f}", "TREND",   "Mild",    "#9333EA","Options")
-
-    atp = safe_num(m.get("atm_pressure", 0))
-    if   atp >=  2000: _add("ATM Pressure", f"{int(atp):,}", "BULLISH", "Strong", GREEN,    "Options")
-    elif atp >      0: _add("ATM Pressure", f"{int(atp):,}", "BULLISH", "Mild",   "#69F0AE", "Options")
-    elif atp <= -2000: _add("ATM Pressure", f"{int(atp):,}", "BEARISH", "Strong", RED,      "Options")
-    elif atp <      0: _add("ATM Pressure", f"{int(atp):,}", "BEARISH", "Mild",   "#FF6D00", "Options")
-    else:              _add("ATM Pressure", f"{int(atp):,}", "SIDEWAYS","—",      MUTED,     "Options")
-
-    g_up = (g_regime or "").upper()
-    if   "PINNED" in g_up or "RANGE" in g_up: _add("Gamma Regime", g_regime, "SIDEWAYS","Pin",     BLUE,  "Options")
-    elif "FLIP"   in g_up:                    _add("Gamma Regime", g_regime, "TREND",   "Unstable",RED,   "Options")
-    elif "TREND"  in g_up or "EXPANSION" in g_up: _add("Gamma Regime", g_regime, "TREND","Volatile",AMBER,"Options")
-    else:                                     _add("Gamma Regime", g_regime, "SIDEWAYS","Transitional",MUTED,"Options")
-
-    if iv_smile_result:
-        scn = (iv_smile_result.get("scenario","") or "").upper()
-        col = iv_smile_result.get("color", MUTED)
-        if   "CALL SKEW" in scn or "BREAKOUT" in scn: _add("IV Smile", iv_smile_result.get("scenario",""), "BULLISH","—",col,"Options")
-        elif "PUT SKEW" in scn or "CRASH" in scn or "PANIC" in scn: _add("IV Smile", iv_smile_result.get("scenario",""), "BEARISH","—",col,"Options")
-        elif "SYMMETRIC" in scn or "WIDE" in scn:      _add("IV Smile", iv_smile_result.get("scenario",""), "TREND","Volatile",col,"Options")
-        else:                                          _add("IV Smile", iv_smile_result.get("scenario",""), "SIDEWAYS","—",col,"Options")
-
-    # ── FUTURES SIGNALS ──────────────────────────────────────────────
     if roll:
-        rsp = safe_num(roll.get("roll_spread_pct", 0))
-        rs  = safe_num(roll.get("roll_spread", 0))
-        if   rsp >  0.2: _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Strong",GREEN,    "Futures")
-        elif rsp >  0:   _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Mild",  "#69F0AE","Futures")
-        elif rsp < -0.2: _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Strong",RED,      "Futures")
-        elif rsp <  0:   _add("Roll Spread",  f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Mild",  "#FF6D00","Futures")
-        else:            _add("Roll Spread",  f"₹{rs:+,.2f}",               "SIDEWAYS","—",    MUTED,    "Futures")
+        rsp = safe_num(roll.get("roll_spread_pct", 0)); rs = safe_num(roll.get("roll_spread", 0))
+        if   rsp >  get_thresh(symbol, "ROLL_SPREAD_STRONG_CONTANGO"): _add("Roll Spread", f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Strong",GREEN)
+        elif rsp >  0:                                                 _add("Roll Spread", f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BULLISH","Mild",  "#69F0AE")
+        elif rsp <  get_thresh(symbol, "ROLL_SPREAD_STRONG_BACKWARD"): _add("Roll Spread", f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Strong",RED)
+        elif rsp <  0:                                                 _add("Roll Spread", f"₹{rs:+,.2f} ({rsp:+.3f}%)", "BEARISH","Mild",  "#FF6D00")
+        else:                                                          _add("Roll Spread", f"₹{rs:+,.2f}",               "SIDEWAYS","—",   MUTED)
 
-        tsb = safe_num(roll.get("ts_bias", 0))
-        tss = roll.get("ts_shape", "—")
-        if   tsb >=  2: _add("Term Structure", tss, "BULLISH","Strong",GREEN,    "Futures")
-        elif tsb ==  1: _add("Term Structure", tss, "BULLISH","Mild",  "#69F0AE","Futures")
-        elif tsb <= -2: _add("Term Structure", tss, "BEARISH","Strong",RED,      "Futures")
-        elif tsb == -1: _add("Term Structure", tss, "BEARISH","Mild",  "#FF6D00","Futures")
-        else:           _add("Term Structure", tss, "SIDEWAYS","—",    MUTED,    "Futures")
+        tsb = safe_num(roll.get("ts_bias", 0)); tss = roll.get("ts_shape", "—")
+        if   tsb >=  2: _add("Term Structure", tss, "BULLISH","Strong",GREEN)
+        elif tsb ==  1: _add("Term Structure", tss, "BULLISH","Mild",  "#69F0AE")
+        elif tsb <= -2: _add("Term Structure", tss, "BEARISH","Strong",RED)
+        elif tsb == -1: _add("Term Structure", tss, "BEARISH","Mild",  "#FF6D00")
+        else:           _add("Term Structure", tss, "SIDEWAYS","—",    MUTED)
 
-        ca = safe_num(carry_anomaly, 1.0)
-        if   ca >= 1.5: _add("Carry Anomaly", f"{ca:.2f}×", "TREND","Big move priced", RED,  "Futures")
-        elif ca <= 0.5: _add("Carry Anomaly", f"{ca:.2f}×", "SIDEWAYS","Normal carry", GREEN,"Futures")
-        else:           _add("Carry Anomaly", f"{ca:.2f}×", "SIDEWAYS","—",            MUTED,"Futures")
-
-        rv = safe_num(roll.get("rollover_velocity", 0.8))
-        if   rv >= 1.3: _add("Rollover Velocity", f"{rv:.2f}", "BULLISH","Conviction", GREEN,    "Futures")
-        elif rv >= 0.8: _add("Rollover Velocity", f"{rv:.2f}", "SIDEWAYS","Normal",    CYAN,     "Futures")
-        elif rv >= 0.3: _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Slow",       AMBER,    "Futures")
-        else:           _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Liquidation",RED,      "Futures")
+        rv = safe_num(roll.get("rollover_velocity", get_thresh(symbol, "ROLL_VEL_NORMAL")))
+        if   rv >= get_thresh(symbol, "ROLL_VEL_CONVICTION"): _add("Rollover Velocity", f"{rv:.2f}", "BULLISH","Conviction", GREEN)
+        elif rv >= get_thresh(symbol, "ROLL_VEL_NORMAL"):      _add("Rollover Velocity", f"{rv:.2f}", "SIDEWAYS","Normal",   CYAN)
+        elif rv >= get_thresh(symbol, "ROLL_VEL_SLOW"):        _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Slow",      AMBER)
+        else:                                                   _add("Rollover Velocity", f"{rv:.2f}", "BEARISH","Liquidation",RED)
 
         rp = safe_num(roll.get("rollover_pct", 0))
-        if   rp >= 40:  _add("Rollover %", f"{rp:.0f}%", "BULLISH","Advanced",   GREEN,"Futures")
-        elif rp >= 20:  _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Normal",    CYAN, "Futures")
-        else:           _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Early",     MUTED,"Futures")
+        if   rp >= get_thresh(symbol, "ROLLOVER_PCT_ADVANCED"): _add("Rollover %", f"{rp:.0f}%", "BULLISH","Advanced", GREEN)
+        elif rp >= get_thresh(symbol, "ROLLOVER_PCT_NORMAL"):    _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Normal",  CYAN)
+        else:                                                     _add("Rollover %", f"{rp:.0f}%", "SIDEWAYS","Early",   MUTED)
 
         if roll_vel_z is not None:
             rz = safe_num(roll_vel_z, 0)
-            if   rz >=  1.0: _add("Roll Vel Z", f"{rz:+.2f}σ", "BULLISH","Above norm", GREEN,    "Futures")
-            elif rz <= -1.0: _add("Roll Vel Z", f"{rz:+.2f}σ", "BEARISH","Below norm", RED,      "Futures")
-            else:            _add("Roll Vel Z", f"{rz:+.2f}σ", "SIDEWAYS","—",         MUTED,    "Futures")
+            if   rz >= get_thresh(symbol, "ZSCORE_BULL"): _add("Roll Vel Z", f"{rz:+.2f}σ", "BULLISH","Above norm", GREEN)
+            elif rz <= get_thresh(symbol, "ZSCORE_BEAR"): _add("Roll Vel Z", f"{rz:+.2f}σ", "BEARISH","Below norm", RED)
+            else:                                          _add("Roll Vel Z", f"{rz:+.2f}σ", "SIDEWAYS","—",         MUTED)
 
-    # ── AGGREGATE (METH-8 fix: symmetric weighting) ─────────────────
-    # Old: bull/bear used weighted scoring (Strong=2, Mild=1) while SIDEWAYS
-    #      and TREND used raw counts. Then verdict mixed them: STRONG BULLISH
-    #      required `net >= 5` (weighted) but SIDEWAYS required `sideways_cnt >= 5`
-    #      (unweighted). Scales weren't comparable.
-    # New: apply the SAME weighted scoring to all four categories, and use
-    #      comparable thresholds in the verdict logic (e.g., sideways_score
-    #      and trend_score use the same scale as bull/bear).
     def _w(s): return 2 if s["strength"] == "Strong" else (1 if s["strength"] not in ("—","") else 0)
-    bull_score      = sum(_w(s) for s in signals if s["bias"] == "BULLISH")
-    bear_score      = sum(_w(s) for s in signals if s["bias"] == "BEARISH")
-    sideways_score  = sum(_w(s) for s in signals if s["bias"] == "SIDEWAYS")
-    trend_score     = sum(_w(s) for s in signals if s["bias"] == "TREND")
-    sideways_cnt    = sum(1 for s in signals if s["bias"] == "SIDEWAYS")   # keep for compat
-    trend_cnt       = sum(1 for s in signals if s["bias"] == "TREND")      # keep for compat
-    net = bull_score - bear_score
-    total = bull_score + bear_score + sideways_score + trend_score
-
-    # METH-8: normalise trend/sideways to be comparable with bull/bear
-    # for verdict purposes. trend_score / max(bull+bear, 1) gives relative weight.
-    trend_ratio   = trend_score   / max(total, 1)
+    bull_score     = sum(_w(s) for s in signals if s["bias"] == "BULLISH")
+    bear_score     = sum(_w(s) for s in signals if s["bias"] == "BEARISH")
+    sideways_score = sum(_w(s) for s in signals if s["bias"] == "SIDEWAYS")
+    sideways_cnt   = sum(1 for s in signals if s["bias"] == "SIDEWAYS")
+    net   = bull_score - bear_score
+    total = bull_score + bear_score + sideways_score
     sideways_ratio = sideways_score / max(total, 1)
 
-    if   net >=  5: verdict, v_color = "STRONG BULLISH 🚀",   GREEN
-    elif net >=  2: verdict, v_color = "BULLISH 📈",          "#69F0AE"
-    elif net <= -5: verdict, v_color = "STRONG BEARISH 📉",   RED
-    elif net <= -2: verdict, v_color = "BEARISH ⚠",           "#FF6D00"
-    elif trend_ratio   >= 0.35: verdict, v_color = "VOLATILE / EXPANSION ⚡", "#9333EA"
-    elif sideways_ratio >= 0.45: verdict, v_color = "SIDEWAYS / RANGE-BOUND ↔", BLUE
-    else: verdict, v_color = "NEUTRAL / TRANSITIONAL",        MUTED
+    if   net >=  4: verdict, v_color = "STRONG BULLISH 🚀",     GREEN
+    elif net >=  2: verdict, v_color = "BULLISH 📈",            "#69F0AE"
+    elif net <= -4: verdict, v_color = "STRONG BEARISH 📉",     RED
+    elif net <= -2: verdict, v_color = "BEARISH ⚠",             "#FF6D00"
+    elif sideways_ratio >= 0.5: verdict, v_color = "SIDEWAYS / RANGE-BOUND ↔", BLUE
+    else: verdict, v_color = "NEUTRAL / TRANSITIONAL", MUTED
 
     return {
         "signals": signals,
@@ -1460,14 +787,11 @@ def compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
         "bull_score": bull_score,
         "bear_score": bear_score,
         "sideways_count": sideways_cnt,
-        "trend_count": trend_cnt,
-        "sideways_score": sideways_score,
-        "trend_score": trend_score,
         "net_score": net,
     }
 
 # ─────────────────────────────────────────────────────────────────────
-#  CHARTS — original + new v4
+#  CHARTS — futures only
 # ─────────────────────────────────────────────────────────────────────
 def chart_layout(**kw):
     return dict(paper_bgcolor="#FFFFFF", plot_bgcolor="#F8FAFC",
@@ -1480,7 +804,7 @@ def score_gauge_fig(score):
     color = GREEN if score >= 70 else (AMBER if score >= 45 else RED)
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=score, domain={"x":[0,1],"y":[0,1]},
-        title={"text":"Market Score","font":{"color":TEXT,"size":12}},
+        title={"text":"Futures Bias Score","font":{"color":TEXT,"size":12}},
         number={"font":{"color":color,"size":36}},
         gauge={"axis":{"range":[0,100],"tickcolor":"#444"},"bar":{"color":color},"bgcolor":CARD,
                "steps":[{"range":[0,30],"color":"#FEE2E2"},{"range":[30,45],"color":"#FFEDD5"},
@@ -1491,77 +815,9 @@ def score_gauge_fig(score):
     fig.update_layout(paper_bgcolor="#FFFFFF",plot_bgcolor="#FFFFFF",margin=dict(l=20,r=20,t=30,b=5),height=220)
     return fig
 
-def build_iv_history_chart(sym_history):
-    empty = go.Figure(); empty.update_layout(**chart_layout(title="Cumulative Δ ATM IV — 15-min buckets"))
-    if len(sym_history) < 2: return empty
-    buckets = {}
-    for x in sym_history:
-        ts = x.get("ts",""); iv = safe_num(x.get("atm_iv",0))
-        if iv <= 0: continue
-        try:
-            p  = ts.split("T")[-1].split(":") if "T" in ts else ts.split(":"); hh,mm = int(p[0]),int(p[1])
-            label = f"{hh:02d}:{(mm//15)*15:02d}"
-        except Exception: label = ts
-        buckets[label] = iv
-    if not buckets: return empty
-    labels = sorted(buckets.keys()); vals = [buckets[l] for l in labels]
-    base = vals[0]; cum_d = [v-base for v in vals]; iv_delta = cum_d[-1] if cum_d else 0
-    direction = "IV RISING" if iv_delta>0.5 else ("IV FALLING" if iv_delta<-0.5 else "IV FLAT")
-    lc = "#059669" if iv_delta<-0.5 else ("#DC2626" if iv_delta>0.5 else CYAN)
-    fig = go.Figure()
-    fig.add_hline(y=0,line_dash="dash",line_color="#94A3B8",opacity=0.7,annotation_text="open baseline",annotation_font_size=10)
-    fig.add_trace(go.Scatter(x=labels,y=cum_d,mode="lines+markers",name="Cumul Δ ATM IV",
-                             line=dict(color=lc,width=2.5),marker=dict(size=6,color=lc),
-                             hovertemplate="<b>%{x}</b><br>Cumul Δ IV: %{y:+.2f}pp<extra></extra>"))
-    lk = chart_layout(title=f"Cumul Δ ATM IV — 15-min | {direction}  ({iv_delta:+.2f}pp)")
-    lk["yaxis"] = dict(title="Δ IV (pp)",gridcolor="#E2E8F0"); lk["xaxis"] = dict(title="15-min bucket",gridcolor="#E2E8F0")
-    fig.update_layout(**lk); return fig
-
-def _build_oi_vel_chart(sym_history, side="CALL"):
-    sl = "Call" if side=="CALL" else "Put"; lc = CYAN if side=="CALL" else PINK
-    bc = "rgba(0,229,255,0.08)" if side=="CALL" else "rgba(255,64,129,0.08)"
-    empty = go.Figure(); empty.update_layout(**chart_layout(title=f"Δ {sl} OI Velocity Z-Score — 15-min"))
-    if len(sym_history) < 3: return empty
-    call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history],dtype=float)
-    put_oi  = np.array([safe_num(x.get("put_oi_total", 0)) for x in sym_history],dtype=float)
-    ts_raw  = [x.get("ts","") for x in sym_history]
-    vel = np.diff(call_oi if side=="CALL" else put_oi); ts_v = ts_raw[1:]
-    def _bkt(t):
-        try: p=t.split("T")[-1].split(":"); return f"{int(p[0]):02d}:{(int(p[1])//15)*15:02d}"
-        except Exception: return t
-    bkts: dict = {}
-    for i,t in enumerate(ts_v): lbl=_bkt(t); bkts[lbl]=bkts.get(lbl,0.0)+float(vel[i])
-    if not bkts: return empty
-    lbc = sorted(bkts.keys()); arc = np.array([bkts[l] for l in lbc],dtype=float)
-    mv = float(arc.mean()); sv = float(arc.std()) if arc.std()>1e-9 else 1.0; za = (arc-mv)/sv
-    ll = _bkt(ts_raw[-1]); lv = sum(float(vel[i]) for i,t in enumerate(ts_v) if _bkt(t)==ll); lz = (lv-mv)/sv
-    al = list(lbc); az = list(za); is_live = [False]*len(lbc)
-    if ll not in lbc: al.append(ll); az.append(lz); is_live.append(True)
-    else: az[-1]=lz; is_live[-1]=True
-    latest_z = az[-1]
-    alert = (f"⚡ SURGE +{latest_z:.1f}σ" if latest_z>=2.0 else f"⚠ ELEVATED +{latest_z:.1f}σ" if latest_z>=1.2 else
-             f"⚡ UNWIND {latest_z:.1f}σ" if latest_z<=-2.0 else f"↘ EASING {latest_z:.1f}σ" if latest_z<=-1.2 else f"NORMAL {latest_z:+.1f}σ")
-    n = len(al); fig = go.Figure()
-    fig.add_trace(go.Scatter(x=al+al[::-1],y=[2.0]*n+[-2.0]*n,fill="toself",fillcolor=bc,
-                             line=dict(color="rgba(255,255,255,0)"),hoverinfo="skip",showlegend=False))
-    cx=[l for l,lv2 in zip(al,is_live) if not lv2]; cy=[z for z,lv2 in zip(az,is_live) if not lv2]
-    lx=[l for l,lv2 in zip(al,is_live) if lv2];     ly=[z for z,lv2 in zip(az,is_live) if lv2]
-    if cx: fig.add_trace(go.Scatter(x=cx,y=cy,mode="lines+markers",name=f"{sl} OI Vel Z",
-                                    line=dict(color=lc,width=2.5),marker=dict(size=6,color=lc),
-                                    hovertemplate="<b>%{x}</b><br>Z: %{y:+.2f}σ<extra></extra>"))
-    if lx:
-        if cx: fig.add_trace(go.Scatter(x=[cx[-1],lx[0]],y=[cy[-1],ly[0]],mode="lines",
-                                        line=dict(color=lc,width=1.5,dash="dot"),showlegend=False,hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=lx,y=ly,mode="markers",name="🔴 Live (forming)",
-                                 marker=dict(size=10,color=lc,opacity=0.5,symbol="circle-open",line=dict(width=2,color=lc))))
-    for yv,dash,col,ann in [(0,"dash","#94A3B8","mean"),(2,"dot",RED,"+2σ"),(1,"dot",AMBER,"+1σ"),(-1,"dot",GREEN,"−1σ"),(-2,"dot",GREEN,"−2σ")]:
-        fig.add_hline(y=yv,line_dash=dash,line_color=col,opacity=0.5,annotation_text=ann,annotation_font_size=10)
-    lk = chart_layout(title=f"Δ {sl} OI Vel Z-Score — 15-min | {alert}")
-    lk["yaxis"]=dict(title="Z-score (σ)",gridcolor="#E2E8F0"); lk["xaxis"]=dict(title="15-min bucket",gridcolor="#E2E8F0")
-    fig.update_layout(**lk); return fig
-
 def build_term_structure_chart(roll: dict):
-    """3-month futures curve. Upward = contango (normal); downward = backwardation (delivery pressure)."""
+    """3-month futures curve. Upward = contango (normal); downward = backwardation (delivery pressure).
+    (UNCHANGED FROM v5)"""
     fig = go.Figure()
     if not roll: fig.update_layout(**chart_layout(title="Futures Term Structure (3-Month Curve)")); return fig
     labels = ["Near","Next"]; prices = [roll["near_ltp"], roll["next_ltp"]]; colors_bar = [GOLD,"#CE93D8"]
@@ -1577,15 +833,11 @@ def build_term_structure_chart(roll: dict):
     fig.update_layout(**lk,showlegend=False); return fig
 
 def build_rollover_velocity_chart(oi_history, symbol):
-    """BUG-4 fix: add explicit negative-velocity buckets + handle None values.
-    Old: bucketed colours as >=1.3 / >=0.8 / >=0.3 / else (red).
-         A velocity of -5.0 (massive liquidation) fell into 'else' → red,
-         indistinguishable from -0.1. The magnitude was invisible.
-         Also, the new BUG-3 fix means velocity can be None for low-activity
-         ticks — those must be excluded from the line plot.
-    New: 5-bucket scheme covering both positive (bullish) and negative (bearish)
-         velocities, with explicit reference lines at ±0.3, ±0.8, ±1.3.
-    """
+    """5-bucket colour scheme covering both positive (bullish) and negative
+    (bearish) velocities, with explicit reference lines. Bucket thresholds
+    are symbol-aware via get_thresh(); ts values may now carry a date
+    prefix (oi_history is persisted to disk), so x-axis labels are
+    shortened back to HH:MM via _disp_hm()."""
     hist = oi_history.get(symbol, []); fig = go.Figure()
     if len(hist) < 3:
         fig.add_annotation(text="Collecting rollover velocity data… refresh a few times",
@@ -1599,29 +851,31 @@ def build_rollover_velocity_chart(oi_history, symbol):
                            xref="paper",yref="paper",x=0.5,y=0.5,showarrow=False,font=dict(color=MUTED,size=12))
         fig.update_layout(**chart_layout(title="Rollover Velocity (Near→Next OI Flow)")); return fig
 
-    ts_v = [p[0] for p in plot_pts]
+    ts_v = [_disp_hm(p[0]) for p in plot_pts]
     rv   = [p[1] for p in plot_pts]
 
-    # BUG-4: 5-bucket colour scheme covering both signs
+    conviction  = get_thresh(symbol, "ROLL_VEL_CONVICTION")
+    normal      = get_thresh(symbol, "ROLL_VEL_NORMAL")
+    slow        = get_thresh(symbol, "ROLL_VEL_SLOW")
+    liquid_mild = get_thresh(symbol, "ROLL_VEL_LIQUID_MILD")
+
     def _color_for(v):
-        if v >=  THRESH.ROLL_VEL_CONVICTION:    return GREEN       # strong conviction roll
-        if v >=  THRESH.ROLL_VEL_NORMAL:        return CYAN        # normal roll
-        if v >=  THRESH.ROLL_VEL_SLOW:          return AMBER       # slow / cautious
-        if v >=  THRESH.ROLL_VEL_LIQUID_MILD:   return "#FF6D00"   # mild liquidation
-        return RED                                                    # hard liquidation
+        if v >=  conviction:    return GREEN       # strong conviction roll
+        if v >=  normal:        return CYAN        # normal roll
+        if v >=  slow:          return AMBER       # slow / cautious
+        if v >=  liquid_mild:   return "#FF6D00"   # mild liquidation
+        return RED                                    # hard liquidation
     colors = [_color_for(v) for v in rv]
 
-    # Reference lines (positive = bullish, negative = bearish)
     for y, col, ann in [
-        ( THRESH.ROLL_VEL_CONVICTION, GREEN,    f"Conviction ≥{THRESH.ROLL_VEL_CONVICTION}"),
-        ( THRESH.ROLL_VEL_NORMAL,     CYAN,     f"Normal ≥{THRESH.ROLL_VEL_NORMAL}"),
-        ( THRESH.ROLL_VEL_SLOW,       AMBER,    f"Slow ≥{THRESH.ROLL_VEL_SLOW}"),
-        ( THRESH.ROLL_VEL_LIQUID_MILD,"#FF6D00", f"Mild liq ≥{THRESH.ROLL_VEL_LIQUID_MILD}"),
-        (-THRESH.ROLL_VEL_LIQUID_MILD,"#FF6D00", f"Hard liq ≤{THRESH.ROLL_VEL_LIQUID_MILD}"),
+        ( conviction,  GREEN,    f"Conviction ≥{conviction}"),
+        ( normal,      CYAN,     f"Normal ≥{normal}"),
+        ( slow,        AMBER,    f"Slow ≥{slow}"),
+        ( liquid_mild, "#FF6D00", f"Mild liq ≥{liquid_mild}"),
+        (-liquid_mild, "#FF6D00", f"Hard liq ≤{liquid_mild}"),
     ]:
         fig.add_hline(y=y, line_dash="dot", line_color=col, opacity=0.6,
                       annotation_text=ann, annotation_font_size=9)
-    # Zero line for clarity
     fig.add_hline(y=0, line_dash="solid", line_color=MUTED, opacity=0.4)
 
     fig.add_trace(go.Scatter(x=ts_v, y=rv, mode="lines+markers",
@@ -1630,6 +884,99 @@ def build_rollover_velocity_chart(oi_history, symbol):
     lk = chart_layout(title="Rollover Velocity — Δ Next OI / max(|Δ Near OI|, floor)")
     lk["yaxis"] = dict(title="Velocity Ratio", gridcolor="#E2E8F0", zeroline=True, zerolinecolor="#94A3B8")
     lk["xaxis"] = dict(title="Time", gridcolor="#E2E8F0"); fig.update_layout(**lk); return fig
+
+def build_score_history_chart(sym_history):
+    """Line chart of the futures bias score across today's session, built
+    from the same per-tick history already being logged for `history`.
+    Cheap to add since the score is already recorded on every tick — this
+    just plots it, giving a sense of whether the bias is strengthening or
+    fading intraday instead of only showing a single point-in-time number."""
+    fig = go.Figure()
+    if len(sym_history) < 2:
+        fig.add_annotation(text="Collecting score history… refresh a few times",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(color=MUTED, size=12))
+        fig.update_layout(**chart_layout(title="Futures Bias Score — Today's Session")); return fig
+
+    def _hm(ts):
+        ts = str(ts)
+        return ts[11:16] if len(ts) >= 16 and ts[10] == "T" else _disp_hm(ts)
+
+    ts_v = [_hm(h.get("ts", "")) for h in sym_history]
+    sc   = [safe_num(h.get("score", 50)) for h in sym_history]
+
+    fig.add_hrect(y0=70, y1=100, fillcolor=GREEN, opacity=0.06, line_width=0)
+    fig.add_hrect(y0=0,  y1=30,  fillcolor=RED,   opacity=0.06, line_width=0)
+    fig.add_hline(y=50, line_dash="dash", line_color=MUTED, opacity=0.5,
+                  annotation_text="neutral", annotation_font_size=10)
+    fig.add_trace(go.Scatter(x=ts_v, y=sc, mode="lines+markers",
+                             line=dict(color=CYAN, width=2), marker=dict(size=5),
+                             hovertemplate="<b>%{x}</b><br>Score: %{y:.1f}<extra></extra>"))
+    lk = chart_layout(title="Futures Bias Score — Today's Session")
+    lk["yaxis"] = dict(title="Score (0-100)", range=[0, 100], gridcolor="#E2E8F0")
+    lk["xaxis"] = dict(title="Time", gridcolor="#E2E8F0")
+    fig.update_layout(**lk); return fig
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCORE CALIBRATION CHECK (owner-only)
+#  Reads the decision-log CSVs this app has already been writing to disk
+#  and checks whether higher scores have actually preceded near-month
+#  price increases — using the app's own logged history rather than a
+#  synthetic backtest. This is a sanity check on the scoring weights,
+#  not a rigorous walk-forward backtest (no slippage/costs modelled, and
+#  early on the sample size will be small).
+# ─────────────────────────────────────────────────────────────────────
+def load_decision_log_history(symbol, max_files=60):
+    """Reads up to `max_files` most recent decision_log_*.csv files from
+    LOG_DIR, filters to `symbol`, and returns a combined, time-sorted
+    DataFrame. Returns an empty DataFrame if nothing has been logged yet."""
+    rows = []
+    try:
+        fnames = sorted(f for f in os.listdir(LOG_DIR) if f.startswith("decision_log_") and f.endswith(".csv"))
+        for fn in fnames[-max_files:]:
+            try:
+                df = pd.read_csv(os.path.join(LOG_DIR, fn))
+            except Exception:
+                continue
+            if "symbol" in df.columns:
+                df = df[df["symbol"] == symbol]
+            if not df.empty:
+                rows.append(df)
+    except Exception as e:
+        print(f"[Calibration] Failed reading logs: {e}")
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    if "ts" in out.columns:
+        out = out.sort_values("ts").reset_index(drop=True)
+    return out
+
+def score_calibration_check(log_df, forward_ticks=15):
+    """Buckets historical ticks by score range and computes the average
+    forward % change in near-month price `forward_ticks` rows later
+    (≈ forward_ticks minutes at a 1-tick-per-minute refresh cadence).
+    Returns None if there isn't enough logged history yet."""
+    required = {"near_ltp", "score"}
+    if log_df.empty or not required.issubset(log_df.columns) or len(log_df) < forward_ticks + 5:
+        return None
+    df = log_df.copy()
+    df["near_ltp"] = pd.to_numeric(df["near_ltp"], errors="coerce")
+    df["score"]    = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["near_ltp", "score"])
+    df["fwd_near_ltp"]   = df["near_ltp"].shift(-forward_ticks)
+    df["fwd_return_pct"] = (df["fwd_near_ltp"] - df["near_ltp"]) / df["near_ltp"] * 100
+    df = df.dropna(subset=["fwd_return_pct"])
+    if df.empty: return None
+    bins   = [0, 30, 45, 55, 70, 100]
+    labels = ["0-30 (Bearish)", "30-45", "45-55 (Neutral)", "55-70", "70-100 (Bullish)"]
+    df["score_bucket"] = pd.cut(df["score"], bins=bins, labels=labels, include_lowest=True)
+    summary = df.groupby("score_bucket", observed=True).agg(
+        n=("fwd_return_pct", "size"),
+        avg_fwd_return_pct=("fwd_return_pct", "mean"),
+        pct_positive=("fwd_return_pct", lambda x: round((x > 0).mean() * 100, 1)),
+    ).reset_index()
+    summary["avg_fwd_return_pct"] = summary["avg_fwd_return_pct"].round(4)
+    return summary
+
 # ═════════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═════════════════════════════════════════════════════════════════════
@@ -1675,18 +1022,25 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # Session state
-for k, v in [("history", None), ("oi_history", {}), ("last_refresh", 0),
-              ("is_owner", False), ("owner_pw_attempt", ""), ("owner_login_error", False),
-              ("iv_smile_history", {})]:
+# NOTE: oi_history is loaded from disk (not just an empty dict) so the
+# rollover-velocity z-score baseline survives an app restart — see the
+# "OI-HISTORY PERSISTENCE" section above for why this matters in practice.
+for k, v in [("history", None), ("oi_history", None), ("last_refresh", 0),
+              ("is_owner", False), ("owner_pw_attempt", ""), ("owner_login_error", False)]:
     if k not in st.session_state:
-        st.session_state[k] = load_history_from_disk() if k == "history" else v
+        if k == "history":
+            st.session_state[k] = load_history_from_disk()
+        elif k == "oi_history":
+            st.session_state[k] = load_oi_history_from_disk()
+        else:
+            st.session_state[k] = v
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
     <div style="text-align:center;padding:8px 0 12px 0;">
         <span style="font-size:20px;">🌟</span>
-        <div style="font-size:13px;font-weight:700;color:{GOLD};margin-top:4px;">Commodities Dashboard</div>
+        <div style="font-size:13px;font-weight:700;color:{GOLD};margin-top:4px;">Commodities Futures Dashboard</div>
     </div>""", unsafe_allow_html=True)
     st.divider()
     if st.session_state["is_owner"]:
@@ -1725,37 +1079,27 @@ is_owner = st.session_state["is_owner"]
 st.markdown(f"""
 <div style="text-align:center;margin-bottom:14px;border-bottom:2px solid {ACCENT};padding-bottom:10px;">
     <h1 style="margin:0;color:{GOLD};font-size:26px;font-weight:800;letter-spacing:1px;">
-        🌟 Shantanu's Commodity Analysis Dashboard
+        🌟 Shantanu's Commodity Futures Analysis Dashboard
     </h1>
     <div style="font-size:11px;color:{MUTED};margin-top:3px;">
-        MCX GOLDM & SILVERM · Term Structure · Gamma Regime · IV Smile · OI Velocity · Regime Detection
+        MCX GOLDM · SILVERM · GOLDPETAL &nbsp;·&nbsp; Term Structure · Rollover Velocity · Carry & Roll Analysis (Futures Only)
     </div>
 </div>""", unsafe_allow_html=True)
 
 # ── TOP CONTROLS ──────────────────────────────────────────────────────
-col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5 = st.columns([1.5,1.5,2,1.5,1])
+col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([2,2,2,1])
 with col_ctrl1:
-    symbol = st.selectbox("COMMODITY", COMMODITY_SYMBOLS, index=0)
+    symbol = st.selectbox("ASSET CLASS", COMMODITY_SYMBOLS, index=0,
+                          format_func=lambda s: SYMBOL_LABELS.get(s, s))
 with col_ctrl2:
-    expiries = fetch_dhan_expiry_list(symbol) if CFG.USE_DHAN else [(date.today()+timedelta(days=10)).strftime("%Y-%m-%d")]
-    if is_owner:
-        expiry = st.selectbox("EXPIRY", expiries, index=0 if expiries else None)
-        st.session_state["selected_expiry"] = expiry
-    else:
-        expiry = st.session_state.get("selected_expiry", expiries[0] if expiries else "")
-        st.markdown(f"""<div style="padding-top:6px;">
-            <div style="font-size:10px;color:{MUTED};text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">EXPIRY</div>
-            <div style="font-size:14px;font-weight:700;color:#80CBC4;">{expiry}</div>
-        </div>""", unsafe_allow_html=True)
-with col_ctrl3:
     st.markdown(f"""<div style="padding-top:28px;font-size:11px;color:{MUTED};font-style:italic;">
         📡 Source: {'Dhan API (MCX) ✅' if CFG.USE_DHAN else 'DEMO MODE (Add credentials in secrets)'}
     </div>""", unsafe_allow_html=True)
-with col_ctrl4:
+with col_ctrl3:
     st.markdown(f"""<div style="padding-top:28px;font-size:11px;color:{MUTED};">
         🕐 Last updated: {strftime_ist('%H:%M:%S')} IST
     </div>""", unsafe_allow_html=True)
-with col_ctrl5:
+with col_ctrl4:
     if is_owner:
         st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
         refresh_clicked = st.button("⟳ Refresh", use_container_width=True)
@@ -1779,121 +1123,73 @@ if auto_refresh:
 if refresh_clicked:
     st.session_state["last_refresh"] = time.time(); st.rerun()
 
-# ── FETCH DATA ────────────────────────────────────────────────────────
-# IMPORTANT: option chain FIRST (matches original app order).
-# Fetching roll before the option chain adds 5 extra API calls — Dhan MCX
-# rate-limits quickly and the 7th call (main option chain) returns partial data,
-# causing jagged/wrong charts. Roll is fetched AFTER the main chain just like
-# the original app-5.py.
-df, spot, exp, source = get_option_chain(symbol, expiry if expiry else None)
-if df.empty:
-    st.error("No data available. Check API credentials or try again."); st.stop()
-
-m        = compute_metrics(df, spot, symbol, expiry=exp)
-atm_iv   = m.get("atm_iv", 0)
-df_band  = m.pop("df_band", df)
-
-# Spot fallback: if option chain returned last_price=0, use roll near_ltp
-# Roll fetched AFTER option chain to avoid Dhan rate-limit on the main OC call
+# ── FETCH FUTURES DATA ────────────────────────────────────────────────
 roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
-# v4-fix: when Dhan returns empty roll (market closed / no data), fall back to demo
 _roll_is_demo = False
 if not roll and CFG.USE_DHAN:
     roll = demo_futures_roll(symbol)
     _roll_is_demo = True
-if spot == 0 and roll and roll.get("near_ltp", 0) > 0:
-    spot = roll["near_ltp"]
-    m    = compute_metrics(df, spot, symbol, expiry=exp)   # recompute with corrected spot
-    atm_iv  = m.get("atm_iv", 0)
-    df_band = m.pop("df_band", df)
+if not roll:
+    st.error("No futures data available. Check API credentials or try again."); st.stop()
 
-# v4 computations
-put_wing_excess, call_wing_excess = compute_wing_excess(df_band, m.get("atm",0), atm_iv, symbol, expiry=exp)
+spot = roll.get("near_ltp", 0)
 
-smile_hist = st.session_state["iv_smile_history"].get(symbol, [])
-iv_smile_result = classify_iv_smile_scenario(df_band, m, spot, symbol, smile_hist)
-if put_wing_excess is not None and call_wing_excess is not None:
-    smile_hist.append({"ts": now_ist().isoformat(timespec="seconds"),
-                       "atm_iv": atm_iv, "put_wing_excess": put_wing_excess, "call_wing_excess": call_wing_excess})
-    if len(smile_hist) > 200: smile_hist = smile_hist[-200:]
-    st.session_state["iv_smile_history"][symbol] = smile_hist
+if _roll_is_demo:
+    st.markdown(f"""<div style="background:{AMBER}22;border:1.5px solid {AMBER};border-radius:8px;
+                padding:8px 16px;margin-bottom:10px;font-size:12px;font-weight:700;color:{AMBER};">
+                ⚠ DEMO DATA IN USE — the live Dhan feed returned no prices (market likely closed
+                or API issue). The score, verdict and every metric below are simulated, not real
+                market signals.</div>""", unsafe_allow_html=True)
 
-step = DHAN_SECURITY.get(symbol, DHAN_SECURITY["GOLDM"])["step"]
-g_regime, g_regime_desc, vol_regime, g_regime_color = classify_gamma_regime(
-    m.get("gex",0), m.get("wall_width",0), m.get("momentum",0),
-    atm_iv, m.get("iv_rank",50), spot, m.get("gamma_flip"), step, symbol=symbol)
-
-# BUG-1 fix: record_intraday_oi FIRST, then compute derived roll metrics.
-# Old order:
-#   1. compute carry_anomaly, roll_vel_z, read rollover_velocity from oi_history
-#   2. record_intraday_oi (appends new tick — but the above already read the OLD history)
-#   → dashboard always showed the *previous* refresh's velocity / z-score
-# New order:
-#   1. record_intraday_oi (appends new tick with current velocity)
-#   2. compute carry_anomaly, roll_vel_z, read rollover_velocity from oi_history
-#   → dashboard reflects the *current* tick's velocity and z-score
+# Record intraday OI FIRST, then compute derived roll metrics so the
+# dashboard reflects the *current* tick's velocity and z-score.
 st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
-
-carry_anomaly = compute_carry_anomaly(roll, atm_iv) if roll else 1.0
+save_oi_history_to_disk(st.session_state["oi_history"])
 roll_vel_z, roll_vel_interp, roll_vel_color = compute_rollover_velocity_zscore(st.session_state["oi_history"], symbol)
 
-if roll:
-    roll["carry_anomaly"]     = carry_anomaly
-    # Read latest velocity from oi_history (now includes current tick)
-    _latest_oi_ticks = st.session_state["oi_history"].get(symbol, [{}])
-    _latest_rv = _latest_oi_ticks[-1].get("rollover_velocity", None) if _latest_oi_ticks else None
-    roll["rollover_velocity"] = _latest_rv if _latest_rv is not None else 0.8
+_latest_oi_ticks = st.session_state["oi_history"].get(symbol, [{}])
+_latest_rv = _latest_oi_ticks[-1].get("rollover_velocity", None) if _latest_oi_ticks else None
+roll["rollover_velocity"] = _latest_rv if _latest_rv is not None else get_thresh(symbol, "ROLL_VEL_NORMAL")
 
-score = compute_score(m, roll)
-strat = strategy_recommendation(score, m, symbol)
+score = compute_futures_score(roll, roll_vel_z, symbol)
+strat = futures_recommendation(score, roll, symbol)
 
 ts_full = now_ist().isoformat(timespec="seconds")
 tick = {
-    "ts": ts_full, "symbol": symbol, "spot": spot, "atm_iv": atm_iv,
-    "net_delta": m.get("net_delta",0), "oi_net_delta": m.get("momentum",0),
-    "max_pain": m.get("max_pain",0), "support": m.get("support",0), "resistance": m.get("resistance",0),
-    "gex": m.get("gex",0), "pcr": m.get("pcr",0), "atm_pressure": m.get("atm_pressure",0),
-    "wall_width": m.get("wall_width",0), "gamma_flip": m.get("gamma_flip",None),
-    "iv_rank": m.get("iv_rank",50), "gt_ratio": m.get("gt_ratio",0),
-    "call_oi_total": m.get("call_oi_total",0), "put_oi_total": m.get("put_oi_total",0),
-    "put_wing_excess":  put_wing_excess  if put_wing_excess  is not None else 0,
-    "call_wing_excess": call_wing_excess if call_wing_excess is not None else 0,
-    "roll_spread_pct":  roll.get("roll_spread_pct",0) if roll else 0,
-    "rollover_pct":     roll.get("rollover_pct",0)    if roll else 0,
-    "ts_bias":          roll.get("ts_bias",0)          if roll else 0,
+    "ts": ts_full, "symbol": symbol,
+    "near_ltp": roll.get("near_ltp",0), "next_ltp": roll.get("next_ltp",0), "far_ltp": roll.get("far_ltp",0),
+    "roll_spread_pct": roll.get("roll_spread_pct",0), "rollover_pct": roll.get("rollover_pct",0),
+    "ts_bias": roll.get("ts_bias",0), "rollover_velocity": roll.get("rollover_velocity",0),
+    "roll_vel_z": roll_vel_z if roll_vel_z is not None else 0, "score": score,
 }
 sym_hist = st.session_state["history"].setdefault(symbol, [])
 if not sym_hist or sym_hist[-1].get("ts","")[:16] != ts_full[:16]:
     sym_hist.append(tick)
     if len(sym_hist) > THRESH.HISTORY_MAX_TICKS: st.session_state["history"][symbol] = sym_hist[-THRESH.HISTORY_MAX_TICKS:]
     save_history_to_disk(st.session_state["history"])
-log_rec = {k: m.get(k,0) for k in _CSV_COLUMNS if k in m}
-log_rec.update({"ts":ts_full,"symbol":symbol,"spot":spot,"expiry":exp,"score":score,
-                "atm":m.get("atm",0),"gamma_flip":m.get("gamma_flip",""),
-                "put_wing_excess":tick["put_wing_excess"],"call_wing_excess":tick["call_wing_excess"],
-                "roll_spread_pct":tick["roll_spread_pct"],"rollover_pct":tick["rollover_pct"],"ts_bias":tick["ts_bias"]})
-write_decision_log(log_rec)
+write_decision_log(dict(tick))
 
 # ── HEADER CARDS ──────────────────────────────────────────────────────
-gf = m.get("gamma_flip")
-theme_color   = SILVER if "SILVER" in symbol else GOLD
-iv_rank_color = RED if m.get("iv_rank",50)>70 else (GREEN if m.get("iv_rank",50)<30 else AMBER)
-pcr_color     = GREEN if m["pcr"]>0.8 else RED
-gf_color      = RED if gf and spot<gf else GREEN
-atp_color     = GREEN if m["atm_pressure"]>0 else RED
+theme_color = SILVER if "SILVER" in symbol else GOLD
+rsp_val   = safe_num(roll.get("roll_spread_pct", 0))
+rsp_color = GREEN if rsp_val > 0 else (RED if rsp_val < 0 else MUTED)
+rp_val    = safe_num(roll.get("rollover_pct", 0))
+rp_color  = GREEN if rp_val >= get_thresh(symbol, "ROLLOVER_PCT_ADVANCED") else (CYAN if rp_val >= get_thresh(symbol, "ROLLOVER_PCT_NORMAL") else MUTED)
+tsb_val   = safe_num(roll.get("ts_bias", 0))
+tsb_color = GREEN if tsb_val > 0 else (RED if tsb_val < 0 else MUTED)
+rv_val    = safe_num(roll.get("rollover_velocity", 0))
+rv_color  = GREEN if rv_val >= get_thresh(symbol, "ROLL_VEL_CONVICTION") else (RED if rv_val < get_thresh(symbol, "ROLL_VEL_SLOW") else CYAN)
 
-header_cols = st.columns(10)
+header_cols = st.columns(8)
 header_data = [
-    ("Commodity",    symbol,                                theme_color),
-    ("Spot Price",   f'₹ {spot:,.2f}',                     "#FFFFFF"),
-    ("Expiry",       exp,                                   MUTED),
-    ("ATM IV",       f'{m.get("atm_iv",0):.2f} %',         "#80CBC4"),
-    ("IV Rank",      f'{m.get("iv_rank",50):.0f}',          iv_rank_color),
-    ("PCR",          f'{m["pcr"]}',                         pcr_color),
-    ("Max Pain",     f'{int(m["max_pain"])}',               "#CE93D8"),
-    ("Gamma Flip",   f'{int(gf)}' if gf else '—',           gf_color),
-    ("ATM Pressure", f'{int(m["atm_pressure"]):+,}',        atp_color),
-    ("Wall Width",   f'{int(m["wall_width"]):,}',           BLUE),
+    ("Asset Class",     symbol,                                     theme_color),
+    ("Near LTP",        f'₹ {spot:,.2f}',                          "#FFFFFF"),
+    ("Near Expiry",     roll.get("near_expiry","—"),                 MUTED),
+    ("Next Expiry",     roll.get("next_expiry","—"),                 MUTED),
+    ("Roll Spread %",   f'{rsp_val:+.3f} %',                        rsp_color),
+    ("Rollover %",      f'{rp_val:.0f} %',                          rp_color),
+    ("Term Structure",  f'{int(tsb_val):+d}',                       tsb_color),
+    ("Rollover Vel.",   f'{rv_val:.2f}',                            rv_color),
 ]
 for col, (label, value, color) in zip(header_cols, header_data):
     col.metric(label, value)
@@ -1903,20 +1199,15 @@ for col, (label, value, color) in zip(header_cols, header_data):
 
 st.markdown("---")
 
-# ── COMBINED MARKET BIAS DECISION MATRIX (Options + Futures) ─────────
-# v4-surgical: top-of-dashboard unified decision matrix combining signals
-# from both the options chain and the futures roll. Does NOT modify any
-# existing logic — only reads computed values and renders a new section.
-combined_bias = compute_combined_market_bias(m, roll, iv_smile_result, g_regime,
-                                             carry_anomaly, roll_vel_z, score)
+# ── FUTURES BIAS DECISION MATRIX ──────────────────────────────────────
+combined_bias = compute_futures_market_bias(roll, roll_vel_z, score, symbol)
 _cb = combined_bias
-st.markdown('<div class="section-header">🧭 Combined Market Bias Decision Matrix — Options + Futures</div>',
+st.markdown('<div class="section-header">🧭 Futures Bias Decision Matrix</div>',
             unsafe_allow_html=True)
 
-# Verdict banner with bull / bear / sideways strength meter
-_bull_pct    = max(0, _cb["bull_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"] + _cb["trend_count"]) * 100
-_bear_pct    = max(0, _cb["bear_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"] + _cb["trend_count"]) * 100
-_side_pct    = 100 - _bull_pct - _bear_pct
+_bull_pct = max(0, _cb["bull_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"]) * 100
+_bear_pct = max(0, _cb["bear_score"]) / max(1, _cb["bull_score"] + _cb["bear_score"] + _cb["sideways_count"]) * 100
+_side_pct = 100 - _bull_pct - _bear_pct
 
 st.markdown(f"""
 <div style="background:{_cb['verdict_color']}15;border:1.5px solid {_cb['verdict_color']};
@@ -1935,28 +1226,19 @@ st.markdown(f"""
             <span style="background:{BLUE}22;color:{BLUE};border:1px solid {BLUE};border-radius:6px;padding:3px 10px;">
                 ↔ Sideways: {_cb['sideways_count']}
             </span>
-            <span style="background:#9333EA22;color:#9333EA;border:1px solid #9333EA;border-radius:6px;padding:3px 10px;">
-                ⚡ Trend: {_cb['trend_count']}
-            </span>
         </div>
     </div>
     <div style="font-size:11px;color:{MUTED};margin-top:6px;">
         Net directional score: <b style="color:{_cb['verdict_color']};">{_cb['net_score']:+d}</b>
-        &nbsp;·&nbsp; Aggregated from {len(_cb['signals'])} live signals
-        (Options + Futures). Strength qualifier ("Strong" / "Mild") scales each
-        signal's weight in the net score.
+        &nbsp;·&nbsp; Aggregated from {len(_cb['signals'])} live futures signals.
+        Strength qualifier ("Strong" / "Mild") scales each signal's weight in the net score.
     </div>
-    <!-- Strength meter bar -->
     <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin-top:10px;border:1px solid {BORDER};">
         <div style="width:{_bull_pct:.1f}%;background:{GREEN};"></div>
         <div style="width:{_side_pct:.1f}%;background:{BLUE};opacity:0.5;"></div>
         <div style="width:{_bear_pct:.1f}%;background:{RED};"></div>
     </div>
 </div>""", unsafe_allow_html=True)
-
-# Signal matrix — split Options vs Futures into two columns
-_opt_signals = [s for s in _cb["signals"] if s["source"] == "Options"]
-_fut_signals = [s for s in _cb["signals"] if s["source"] == "Futures"]
 
 def _render_signal_cell(s):
     return f"""
@@ -1972,38 +1254,25 @@ def _render_signal_cell(s):
         <div style="flex-shrink:0;">{_bias_tag(s['bias'], s['strength'], s['color'])}</div>
     </div>"""
 
+_signals = _cb["signals"]
+_half = (len(_signals) + 1) // 2
 _mx_cols = st.columns(2)
 with _mx_cols[0]:
-    st.markdown(f"""<div style="font-size:11px;font-weight:700;color:{GOLD};
-                text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">
-                📊 Options Signals ({len(_opt_signals)})</div>""", unsafe_allow_html=True)
-    for s in _opt_signals:
+    for s in _signals[:_half]:
         st.markdown(_render_signal_cell(s), unsafe_allow_html=True)
 with _mx_cols[1]:
-    _fut_label_color = CYAN if _fut_signals else MUTED
-    st.markdown(f"""<div style="font-size:11px;font-weight:700;color:{_fut_label_color};
-                text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">
-                📦 Futures Signals ({len(_fut_signals)})</div>""", unsafe_allow_html=True)
-    if _fut_signals:
-        for s in _fut_signals:
-            st.markdown(_render_signal_cell(s), unsafe_allow_html=True)
-    else:
-        st.markdown(f"""<div style="background:{CARD};border:1px dashed {BORDER};border-radius:6px;
-                    padding:12px;text-align:center;color:{MUTED};font-size:11px;">
-                    Roll data unavailable — futures signals will populate when MCX market is open.
-                    </div>""", unsafe_allow_html=True)
+    for s in _signals[_half:]:
+        st.markdown(_render_signal_cell(s), unsafe_allow_html=True)
 
-# Plain-English legend explaining how to read the matrix
 st.markdown(f"""
 <div style="background:{SECTION_BG};border-radius:8px;padding:8px 14px;margin-top:8px;
             font-size:11px;color:{MUTED};line-height:1.5;">
-    <b>How to read this matrix:</b> Each cell shows a live metric with a colour-coded bias chip —
+    <b>How to read this matrix:</b> Each cell shows a live futures metric with a colour-coded bias chip —
     <span style="color:{GREEN};font-weight:700;">🟢 BULLISH</span>,
-    <span style="color:{RED};font-weight:700;">🔴 BEARISH</span>,
-    <span style="color:{BLUE};font-weight:700;">🔵 SIDEWAYS</span> (range / pinned),
-    or <span style="color:#9333EA;font-weight:700;">🟣 TREND</span> (volatile / expansion).
+    <span style="color:{RED};font-weight:700;">🔴 BEARISH</span>, or
+    <span style="color:{BLUE};font-weight:700;">🔵 SIDEWAYS</span> (range / normal).
     "Strong" signals carry 2× the weight of "Mild" signals. The verdict at the top is the
-    net of all bullish minus bearish scores; ties fall back to a sideways or volatile verdict.
+    net of all bullish minus bearish scores; ties fall back to a sideways or neutral verdict.
 </div>""", unsafe_allow_html=True)
 
 st.markdown("---")
@@ -2017,25 +1286,21 @@ with col_strat:
     <div class="strat-box" style="border-left-color:{strat['color']};">
         <div style="font-size:10px;color:{MUTED};">MARKET MODE</div>
         <div style="font-size:16px;font-weight:700;color:{strat['mode_color']};margin-bottom:10px;">{strat['market_mode']}</div>
-        <div style="font-size:10px;color:{MUTED};">STRATEGY</div>
+        <div style="font-size:10px;color:{MUTED};">BIAS</div>
         <div style="font-size:14px;font-weight:700;color:{strat['color']};margin-bottom:8px;">{strat['name']}</div>
-        <div style="font-size:10px;color:{MUTED};">EXECUTION</div>
-        <div style="font-size:12px;color:#CCC;font-family:monospace;">{strat['legs']}</div>
+        <div style="font-size:10px;color:{MUTED};">RECOMMENDED ACTION</div>
+        <div style="font-size:12px;color:#CCC;font-family:monospace;">{strat['action']}</div>
     </div>""", unsafe_allow_html=True)
 with col_metrics:
     metric_items = [
-        ("EV Ratio",    f'{m["ev_ratio"]}',              GREEN if m["ev_ratio"]>=1.2 else RED,         METRIC_EXPLAIN["EV Ratio"]),
-        ("Net Delta",   f'{int(m["net_delta"]):,}',      GREEN if m["net_delta"]>0 else RED,           METRIC_EXPLAIN["Net Delta"]),
-        ("Momentum",    f'{int(m["momentum"]):,}',       GREEN if m["momentum"]>0 else RED,            METRIC_EXPLAIN["Momentum"]),
-        ("Vega Skew",   f'{m["vega_skew"]}',             GREEN if m["vega_skew"]>=1.2 else RED,        METRIC_EXPLAIN["Vega Skew"]),
-        ("GEX",         f'{m["gex"]:,.0f}',              GREEN if m["gex"]>0 else RED,                 METRIC_EXPLAIN["GEX"]),
-        ("Vanna",       f'{m["vanna"]:,.2f}',            GREEN if m["vanna"]>0 else RED,               METRIC_EXPLAIN["Vanna"]),
-        ("G/T Ratio",   f'{m["gt_ratio"]}',              BLUE,                                         METRIC_EXPLAIN["G/T Ratio"]),
-        ("Skew Slope",  f'{m["skew_slope"]:.4f}',        RED if m["skew_slope"]>0.15 else MUTED,       METRIC_EXPLAIN["Skew Slope"]),
-        ("Support",     f'{int(m["support"])}',          GREEN, ""),
-        ("Resistance",  f'{int(m["resistance"])}',       RED,   ""),
-        ("Near OI %",   f'{m["near_oi_concentration"]*100:.0f}%', BLUE,                                METRIC_EXPLAIN["Near OI %"]),
-        ("PCR",         f'{m["pcr"]}',                   GREEN if m["pcr"]>0.8 else RED,               METRIC_EXPLAIN["PCR"]),
+        ("Roll Spread (₹)",   f'{roll.get("roll_spread",0):+,.2f}',        GREEN if roll.get("roll_spread",0)>0 else RED, METRIC_EXPLAIN["Roll Spread"]),
+        ("Roll Spread %",     f'{roll.get("roll_spread_pct",0):+.3f}%',    rsp_color,                                     METRIC_EXPLAIN["Spread %"]),
+        ("Rollover %",        f'{roll.get("rollover_pct",0)}%',            BLUE,                                          METRIC_EXPLAIN["Rollover %"]),
+        ("Rollover Velocity", f'{roll.get("rollover_velocity",0):.2f}',    rv_color,                                      METRIC_EXPLAIN["Rollover Velocity"]),
+        ("Roll Vel Z-Score",  f'{roll_vel_z:+.2f}σ' if roll_vel_z is not None else "—", MUTED if roll_vel_z is None else (GREEN if roll_vel_z>=get_thresh(symbol,"ZSCORE_BULL") else (RED if roll_vel_z<=get_thresh(symbol,"ZSCORE_BEAR") else MUTED)), "Z-score of latest rollover velocity vs its recent rolling baseline."),
+        ("Near Vol/OI",       f'{roll.get("near_vol_oi",0):.3f}',          GREEN if roll.get("near_vol_oi",0)>0.3 else AMBER, METRIC_EXPLAIN["Near Vol/OI"]),
+        ("Slope Near→Next",   f'{roll.get("slope_near_next",0):+.2f}% p.a.', GREEN if roll.get("slope_near_next",0)>0 else RED, METRIC_EXPLAIN["Slope Near→Next"]),
+        ("Slope Next→Far",    f'{roll.get("slope_next_far",0):+.2f}% p.a.' if roll.get("has_far") else "—", GREEN if roll.get("slope_next_far",0)>0 else RED, METRIC_EXPLAIN["Slope Next→Far"]),
     ]
     for row_start in range(0, len(metric_items), 4):
         row_items = metric_items[row_start:row_start+4]
@@ -2049,108 +1314,22 @@ with col_metrics:
                 <div class="explain-text">{explain}</div>
             </div>""", unsafe_allow_html=True)
 
-# ── CHARTS ROW 1 ──────────────────────────────────────────────────────
+# ── SCORE TREND — TODAY'S SESSION ──────────────────────────────────────
+# The score is already recorded on every tick (see `tick` above); this
+# just plots it, so you can see whether the bias is strengthening or
+# fading intraday instead of only seeing a single point-in-time number.
 st.markdown("---")
-st.markdown('<div class="section-header">📊 Options Analysis Charts</div>', unsafe_allow_html=True)
-chart_cols = st.columns(3)
+st.markdown('<div class="section-header">📈 Score Trend — Today\'s Session</div>', unsafe_allow_html=True)
+st.plotly_chart(build_score_history_chart(st.session_state["history"].get(symbol, [])),
+                use_container_width=True, config={"displayModeBar":False})
 
-def _vline(fig, val, color, label):
-    if val: fig.add_vline(x=val, line_dash="dash", line_color=color, opacity=0.7,
-                          annotation_text=label, annotation_font_size=10)
-
-with chart_cols[0]:
-    dv = df_band["call_oi"] - df_band["put_oi"]
-    f1 = go.Figure(go.Bar(x=df_band["strike"],y=dv,marker_color=[RED if v>0 else GREEN for v in dv],name="Net OI"))
-    _vline(f1,spot,AMBER,"Spot"); _vline(f1,gf,PINK,"γ-Flip")
-    f1.update_layout(**chart_layout(title="Net OI (Call − Put) [Delta Proxy]"))
-    st.plotly_chart(f1, use_container_width=True, config={"displayModeBar":False})
-with chart_cols[1]:
-    mv = df_band["call_oi_chg"] - df_band["put_oi_chg"]
-    f2 = go.Figure(go.Bar(x=df_band["strike"],y=mv,marker_color=[RED if v>0 else GREEN for v in mv],name="OI Change"))
-    _vline(f2,spot,AMBER,"Spot")
-    f2.update_layout(**chart_layout(title="OI Momentum (Change in OI)"))
-    st.plotly_chart(f2, use_container_width=True, config={"displayModeBar":False})
-with chart_cols[2]:
-    gv = (df_band["call_oi"]*df_band["call_gamma"]-df_band["put_oi"]*df_band["put_gamma"])*spot**2*0.01
-    f3 = go.Figure(go.Bar(x=df_band["strike"],y=gv,marker_color=[RED if v>0 else GREEN for v in gv],name="GEX"))
-    _vline(f3,spot,AMBER,"Spot"); _vline(f3,gf,PINK,"γ-Flip")
-    f3.update_layout(**chart_layout(title="Gamma Exposure (GEX) per Strike"))
-    st.plotly_chart(f3, use_container_width=True, config={"displayModeBar":False})
-
-chart_cols2 = st.columns(2)
-with chart_cols2[0]:
-    f4 = go.Figure([
-        go.Bar(x=df_band["strike"],y=df_band["call_oi"],name="Call OI",marker_color=GOLD),
-        go.Bar(x=df_band["strike"],y=df_band["put_oi"], name="Put OI", marker_color=SILVER),
-    ])
-    _vline(f4,spot,AMBER,"Spot")
-    f4.update_layout(**chart_layout(title="Call vs Put OI",barmode="group",
-                                    legend=dict(orientation="h",y=1.08,x=0)))
-    st.plotly_chart(f4, use_container_width=True, config={"displayModeBar":False})
-with chart_cols2[1]:
-    # IV Smile — filter to liquid strikes (OI > 0) to avoid zero-IV zigzag
-    iv_df = df_band[df_band["call_oi"] + df_band["put_oi"] > 0].copy()
-    # Smooth noisy API IVs with a 3-point rolling average for display
-    iv_df = iv_df.sort_values("strike")
-    civ_smooth = iv_df["call_iv"].rolling(3, center=True, min_periods=1).mean()
-    piv_smooth = iv_df["put_iv"].rolling(3, center=True, min_periods=1).mean()
-    f5 = go.Figure([
-        go.Scatter(x=iv_df["strike"], y=civ_smooth, mode="lines+markers", name="Call IV (smoothed)",
-                   line=dict(color=GOLD, width=2), marker=dict(size=5)),
-        go.Scatter(x=iv_df["strike"], y=piv_smooth, mode="lines+markers", name="Put IV (smoothed)",
-                   line=dict(color=SILVER, width=2), marker=dict(size=5)),
-        go.Scatter(x=iv_df["strike"], y=iv_df["call_iv"], mode="markers", name="Call IV (raw)",
-                   marker=dict(color=GOLD, size=4, opacity=0.35, symbol="circle-open")),
-        go.Scatter(x=iv_df["strike"], y=iv_df["put_iv"],  mode="markers", name="Put IV (raw)",
-                   marker=dict(color=SILVER, size=4, opacity=0.35, symbol="circle-open")),
-    ])
-    _vline(f5,spot,AMBER,"Spot")
-    f5.update_layout(**chart_layout(title="IV Smile (liquid strikes, 3pt smoothed)",yaxis_title="IV %",
-                                    legend=dict(orientation="h",y=1.08,x=0)))
-    st.plotly_chart(f5, use_container_width=True, config={"displayModeBar":False})
-
-# ── OPTION CHAIN TABLE ────────────────────────────────────────────────
-st.markdown("---")
-st.markdown("### 📋 MCX Option Chain — ATM Band")
-table_rows = []
-for _, r in df_band.sort_values("strike").iterrows():
-    K = r["strike"]
-    table_rows.append({
-        "Call OI": f"{int(r['call_oi']):,}", "Call ΔOI": f"{int(r['call_oi_chg']):,}",
-        "Call IV %": f"{r['call_iv']:.1f}", "Call Δ": f"{r['call_delta']:.3f}",
-        "STRIKE": f"{int(K)} {'◀ ATM' if K==m.get('atm',0) else ''}",
-        "Put Δ": f"{r['put_delta']:.3f}", "Put IV %": f"{r['put_iv']:.1f}",
-        "Put ΔOI": f"{int(r['put_oi_chg']):,}", "Put OI": f"{int(r['put_oi']):,}",
-    })
-st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-# ── KEY PRICE LEVELS ──────────────────────────────────────────────────
-st.markdown("---")
-st.markdown("### 📍 Key Price Levels")
-level_items = [
-    ("🧲 Max Pain",   int(m["max_pain"]),   "#CE93D8", "Market tends to close near this on expiry"),
-    ("🛡 Support",    int(m["support"]),    GREEN,     "Highest put OI — strong floor"),
-    ("🚧 Resistance", int(m["resistance"]), RED,       "Highest call OI — strong ceiling"),
-    ("⚡ ATM Strike", int(m.get("atm",0)), BLUE,       "At-the-money strike"),
-]
-if gf: level_items.append(("🔀 Gamma Flip", int(gf), PINK, "Below = dealer short-gamma → trend amplification"))
-level_cols = st.columns(len(level_items))
-for col, (lbl, val, c, tip) in zip(level_cols, level_items):
-    col.markdown(f"""
-    <div style="background-color:{CARD};border-radius:8px;padding:10px 18px;
-                border:1px solid {BORDER};border-bottom:3px solid {c};">
-        <div style="font-size:11px;color:{MUTED};">{lbl}</div>
-        <div style="font-size:22px;font-weight:700;color:{c};">{val}</div>
-        <div class="explain-text">{tip}</div>
-    </div>""", unsafe_allow_html=True)
-
-# ── FUTURES ROLL ──────────────────────────────────────────────────────
+# ── FUTURES ROLL — CONTRACT CARDS, SPREAD/ROLLOVER, CHARTS ────────────
+# (UNCHANGED FROM v5 — no options logic here)
 st.markdown("---")
 st.markdown("### 📦 Futures Roll Analysis & Intraday OI Curve")
 if roll:
     if _roll_is_demo:
         st.caption("⚠ **Demo roll data** — live Dhan feed returned no prices (market likely closed). Roll metrics use simulated values.")
-    # ── Contract cards: Near / Next / Far ─────────────────────────────
     _has_far = roll.get("has_far") and roll.get("far_ltp", 0) > 0
     _ncols   = 3 if _has_far else 2
     _contract_cols = st.columns(_ncols)
@@ -2159,7 +1338,6 @@ if roll:
         oi_str   = f"{oi:,}"  if oi  > 0 else "—"
         vol_str  = f"{vol:,}" if vol > 0 else "—"
         voi_str  = f"{vol_oi:.3f}" if vol_oi > 0 else "—"
-        # Shorten trading symbol for display
         disp_sym = tsym[-7:] if len(tsym) > 7 else tsym
         col.markdown(f"""
         <div style="background:{CARD};border-radius:10px;padding:12px 16px;
@@ -2191,21 +1369,16 @@ if roll:
             </div>
         </div>""", unsafe_allow_html=True)
 
-    # ── v4-surgical: plain-English bias lines for each contract card ──
     _near_voi    = safe_num(roll.get("near_vol_oi", 0))
     _near_voi_b  = ("BULLISH" if _near_voi > 0.3 else "SIDEWAYS") if _near_voi > 0 else "SIDEWAYS"
     _near_voi_s  = "Active fresh positioning" if _near_voi > 0.3 else ("Normal" if _near_voi > 0 else "—")
     _near_voi_c  = GREEN if _near_voi > 0.3 else (CYAN if _near_voi > 0 else MUTED)
 
     _next_voi    = safe_num(roll.get("next_vol_oi", 0))
-    _next_voi_b  = ("BULLISH" if _next_voi > 0.3 else "SIDEWAYS") if _next_voi > 0 else "SIDEWAYS"
-    _next_voi_s  = "Active rollover flow" if _next_voi > 0.3 else ("Normal" if _next_voi > 0 else "—")
-    _next_voi_c  = GREEN if _next_voi > 0.3 else (CYAN if _next_voi > 0 else MUTED)
-
     _rollover_pct_val = safe_num(roll.get("rollover_pct", 0))
-    if   _rollover_pct_val >= 40: _rollp_b, _rollp_s, _rollp_c = "BULLISH", "Advanced rollover", GREEN
-    elif _rollover_pct_val >= 20: _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Normal pace",     CYAN
-    else:                         _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Early / cautious", MUTED
+    if   _rollover_pct_val >= get_thresh(symbol, "ROLLOVER_PCT_ADVANCED"): _rollp_b, _rollp_s, _rollp_c = "BULLISH", "Advanced rollover", GREEN
+    elif _rollover_pct_val >= get_thresh(symbol, "ROLLOVER_PCT_NORMAL"):    _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Normal pace",     CYAN
+    else:                                                                   _rollp_b, _rollp_s, _rollp_c = "SIDEWAYS", "Early / cautious", MUTED
 
     _near_bias_html = (
         f"{_bias_tag(_near_voi_b, _near_voi_s, _near_voi_c)} "
@@ -2234,19 +1407,18 @@ if roll:
                            roll["far_ltp"], roll["far_oi"], roll["far_vol"], roll["far_vol_oi"],
                            roll["far_expiry"], roll.get("far_tsym","FAR"), _far_bias_html)
 
-    # ── Spread / Rollover row ──────────────────────────────────────────
     st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
     _spr_cols = st.columns(4)
 
-    # v4-surgical: helper to compute plain-English bias for a spread %
-    def _spread_bias(pct):
-        if   pct >  0.2: return "BULLISH", "Strong contango", GREEN
-        elif pct >  0:   return "BULLISH", "Mild contango",   "#69F0AE"
-        elif pct < -0.2: return "BEARISH", "Strong backwardation", RED
-        elif pct <  0:   return "BEARISH", "Mild backwardation",   "#FF6D00"
-        else:            return "SIDEWAYS", "Flat / no carry",      MUTED
+    def _spread_bias(pct, _sym=symbol):
+        strong_up   = get_thresh(_sym, "ROLL_SPREAD_STRONG_CONTANGO")
+        strong_down = get_thresh(_sym, "ROLL_SPREAD_STRONG_BACKWARD")
+        if   pct >  strong_up:   return "BULLISH", "Strong contango", GREEN
+        elif pct >  0:           return "BULLISH", "Mild contango",   "#69F0AE"
+        elif pct < strong_down:  return "BEARISH", "Strong backwardation", RED
+        elif pct <  0:           return "BEARISH", "Mild backwardation",   "#FF6D00"
+        else:                    return "SIDEWAYS", "Flat / no carry",      MUTED
 
-    # v4-surgical: plain-English bias lines for spread / rollover row
     _rsp = safe_num(roll.get("roll_spread_pct", 0))
     _rs_b, _rs_s, _rs_c = _spread_bias(_rsp)
     _rp_b, _rp_s, _rp_c = (_rollp_b, _rollp_s, _rollp_c)
@@ -2288,7 +1460,6 @@ if roll:
             <div style="font-size:10px;margin-top:4px;line-height:1.4;">{bias_html}</div>
         </div>""", unsafe_allow_html=True)
 
-    # ── Charts: OI bar (near/next/far) + Intraday OI curve ───────────
     roll_chart_cols = st.columns(2)
     with roll_chart_cols[0]:
         _bar_x     = [roll.get("near_tsym","Near")[-7:], roll.get("next_tsym","Next")[-7:]]
@@ -2340,123 +1511,15 @@ if roll:
 else:
     st.warning("Roll data unavailable — market may be closed or outside MCX trading hours (9 AM – 11:30 PM IST).")
 
-# ── SECTION 8: INTELLIGENCE DASHBOARD ─────────────────────────────────
+# ── FUTURES INTELLIGENCE — TERM STRUCTURE & ROLLOVER VELOCITY ────────
 st.markdown("---")
-st.markdown('<div class="section-header">⚡ Section 8 — OI Regime · OI Velocity · IV History · Combined Bias Panel</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">🔮 Futures Intelligence — Term Structure · Rollover Velocity</div>', unsafe_allow_html=True)
 
-sym_history = _extract_sym_history(st.session_state["history"], symbol)
-labels, c_bkt, p_bkt = _bucket_oi_15min(sym_history)
-regime_info = _oi_regime_info(c_bkt, p_bkt)
-bias_info   = _combined_bias_info(c_bkt, p_bkt)
-oi_vel      = compute_oi_velocity(st.session_state["history"], symbol)
-
-st.markdown(f"""
-<div class="regime-banner" style="background:{regime_info['bg']};border:1.5px solid {regime_info['border']};">
-    <div class="regime-label" style="color:{regime_info['fg']};">{regime_info['label']}</div>
-    <div class="regime-sub" style="color:{regime_info['fg']};">{regime_info['sub']}</div>
-</div>""", unsafe_allow_html=True)
-
-alert_col = {"NONE":GREEN,"WATCH":AMBER,"DANGER":RED}.get(oi_vel["alert_level"],MUTED)
-vel_cols = st.columns([1,1,2])
-vel_items = [
-    ("Call OI Vel / tick", oi_vel["call_oi_velocity"], oi_vel["call_vel_zscore"]),
-    ("Put OI Vel / tick",  oi_vel["put_oi_velocity"],  oi_vel["put_vel_zscore"]),
-]
-for col, (label, vel, zscore) in zip(vel_cols[:2], vel_items):
-    cc = RED if zscore>=2.0 else (AMBER if zscore>=1.2 else (GREEN if zscore<=-1.2 else MUTED))
-    col.markdown(f"""
-    <div style="background-color:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
-        <div style="font-size:11px;font-weight:700;color:{TEXT};text-transform:uppercase;letter-spacing:0.5px;">{label}</div>
-        <div style="font-size:18px;font-weight:700;color:{cc};">{vel:+,.0f}</div>
-        <div style="font-size:12px;font-weight:600;color:{cc};">z={zscore:+.2f}σ</div>
-    </div>""", unsafe_allow_html=True)
-with vel_cols[2]:
-    st.markdown(f"""
-    <div style="background-color:{CARD};border-radius:8px;padding:10px 14px;
-                border:1px solid {BORDER};min-height:80px;display:flex;align-items:center;">
-        <span class="alert-text" style="color:{alert_col};">{oi_vel['alert_text']}</span>
-    </div>""", unsafe_allow_html=True)
-
-sec8_cols = st.columns(3)
-with sec8_cols[0]: st.plotly_chart(build_iv_history_chart(sym_history),use_container_width=True,config={"displayModeBar":False})
-with sec8_cols[1]: st.plotly_chart(_build_oi_vel_chart(sym_history,side="CALL"),use_container_width=True,config={"displayModeBar":False})
-with sec8_cols[2]: st.plotly_chart(_build_oi_vel_chart(sym_history,side="PUT"),use_container_width=True,config={"displayModeBar":False})
-
-if bias_info:
-    MATRIX = [
-        ("Call ↑  Put ↑","PINNED",      BLUE,      "Both walls building → pin / range / max-pain gravity"),
-        ("Call ↑  Put ↓","BULLISH",     GREEN,     "Ceiling stays, floor gone → slow drift up"),
-        ("Call ↓  Put ↑","BEARISH",     RED,       "Ceiling gone, floor stays → slow drift down"),
-        ("Call ↓  Put ↓","EXPANSION",   "#9333EA", "All walls dissolving → breakout/breakdown risk"),
-        ("Call ↑  Put ~","MILD BEARISH",AMBER,     "Ceiling heavy, floor neutral → capped / mild bear"),
-        ("Call ~  Put ↑","MILD BULLISH","#10B981", "Floor solid, ceiling neutral → lifted / mild bull"),
-    ]
-    bc_c = bias_info["bc"]; c_z = bias_info["c_z"]; p_z = bias_info["p_z"]
-    def _z_badge(label, z):
-        col_b = RED if z>1.5 else (AMBER if z>0.5 else (GREEN if z<-1.5 else (AMBER if z<-0.5 else MUTED)))
-        return f"""<span style="background:{col_b}33;color:{col_b};border:1px solid {col_b};border-radius:6px;
-                   padding:2px 8px;font-size:12px;font-weight:700;margin-right:8px;white-space:nowrap;">
-                   {label}: {z:+.2f}σ</span>"""
-    st.markdown(f"""
-    <div style="background-color:{CARD};border:1px solid {bc_c};border-left:4px solid {bc_c};
-                border-radius:10px;padding:16px 18px;margin-top:12px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
-            <span style="font-size:15px;font-weight:800;color:{bc_c};">{bias_info['bias']}</span>
-            <div>{_z_badge("Call OI",c_z)}{_z_badge("Put OI",p_z)}</div>
-        </div>
-        <div style="font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;margin-bottom:8px;">📋 6-Scenario Reference</div>
-    </div>""", unsafe_allow_html=True)
-    bias_cols = st.columns(6)
-    for col, (combo,blabel,bcolor,bdesc) in zip(bias_cols,MATRIX):
-        is_active = blabel in bias_info["bias"]
-        col.markdown(f"""
-        <div class="bias-cell" style="background:{bcolor}{'22' if is_active else '11'};
-                    border:{'2px' if is_active else '1px'} solid {bcolor};">
-            <div style="font-size:11px;font-weight:700;color:{bcolor};font-family:monospace;margin-bottom:2px;">{combo}</div>
-            <div style="font-size:12px;font-weight:800;color:{bcolor};margin-bottom:3px;">{blabel}</div>
-            <div style="font-size:10px;color:{TEXT};line-height:1.4;">{bdesc}</div>
-        </div>""", unsafe_allow_html=True)
-
-# ── SECTION 9: FUTURES INTELLIGENCE ──────────────────────────────────
-st.markdown("---")
-st.markdown('<div class="section-header">🔮 Section 9 — Futures Intelligence · Gamma Regime · IV Smile · Carry Anomaly</div>', unsafe_allow_html=True)
-
-# Gamma Regime Banner
-st.markdown(f"""
-<div style="background:{g_regime_color}22;border:1.5px solid {g_regime_color};border-radius:10px;
-            padding:12px 20px;margin-bottom:12px;">
-    <div style="font-size:14px;font-weight:800;color:{g_regime_color};letter-spacing:0.5px;">
-        ⚡ GAMMA REGIME: {g_regime} — {vol_regime}
-    </div>
-    <div style="font-size:12px;color:{g_regime_color};opacity:0.85;margin-top:3px;">{g_regime_desc}</div>
-    <div class="explain-text" style="margin-top:4px;">{METRIC_EXPLAIN["Gamma Regime"]}</div>
-</div>""", unsafe_allow_html=True)
-
-# IV Smile Scenario
-if iv_smile_result:
-    isc = iv_smile_result.get("color", MUTED)
-    st.markdown(f"""
-    <div style="background:{isc}15;border:1.5px solid {isc};border-radius:10px;
-                padding:12px 18px;margin-bottom:12px;">
-        <div style="font-size:13px;font-weight:800;color:{isc};">
-            📐 IV SMILE: {iv_smile_result.get('scenario','N/A')}
-        </div>
-        <div style="font-size:11px;color:{isc};margin-top:3px;opacity:0.85;">{iv_smile_result.get('desc','')}</div>
-        <div style="font-size:10px;color:{MUTED};margin-top:4px;">
-            Put wing excess: {iv_smile_result.get('put_wing_excess',0):+.2f} pp  |  
-            Call wing excess: {iv_smile_result.get('call_wing_excess',0):+.2f} pp  |  
-            Session trend put: {iv_smile_result.get('trend_put',0):+.2f}  |  
-            Session trend call: {iv_smile_result.get('trend_call',0):+.2f}
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-# Term Structure + Rollover Velocity
 sec9_cols = st.columns(2)
 with sec9_cols[0]:
     st.plotly_chart(build_term_structure_chart(roll), use_container_width=True, config={"displayModeBar":False})
     if roll:
         sc_nn = roll.get('slope_near_next',0); sc_nf = roll.get('slope_next_far',0)
-        # v4-surgical: inline bias chips for term-structure slopes
         _nn_b = "BULLISH" if sc_nn > 0 else ("BEARISH" if sc_nn < 0 else "SIDEWAYS")
         _nn_s = "Contango" if sc_nn > 0 else ("Backwardation" if sc_nn < 0 else "Flat")
         _nn_c = GREEN if sc_nn > 0 else (RED if sc_nn < 0 else MUTED)
@@ -2486,34 +1549,18 @@ with sec9_cols[1]:
     st.plotly_chart(build_rollover_velocity_chart(st.session_state["oi_history"], symbol),
                     use_container_width=True, config={"displayModeBar":False})
 
-# Carry Anomaly + metrics row
-sec9_mcols = st.columns(5)
-ca_color = RED if carry_anomaly >= 1.5 else (GREEN if carry_anomaly <= 0.5 else MUTED)
-# v4-surgical: bias chip + plain English for Carry Anomaly
-if   carry_anomaly >= 1.5: _ca_b, _ca_s = "TREND",    "Big move priced"
-elif carry_anomaly <= 0.5: _ca_b, _ca_s = "SIDEWAYS", "Normal carry"
-else:                       _ca_b, _ca_s = "SIDEWAYS", "—"
+# Roll Vel Z / Near Vol/OI / Far Month LTP / Term Structure Bias cards
+sec9_mcols = st.columns(4)
 with sec9_mcols[0]:
-    st.markdown(f"""
-    <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
-        <div style="font-size:10px;color:{MUTED};text-transform:uppercase;">Carry Anomaly</div>
-        <div style="font-size:20px;font-weight:700;color:{ca_color};">{carry_anomaly:.2f}×</div>
-        <div class="explain-text">{METRIC_EXPLAIN['Carry Anomaly']}</div>
-        <div style="margin-top:4px;font-size:10px;line-height:1.4;">{_bias_tag(_ca_b, _ca_s, ca_color)}
-            <span style="color:{TEXT};">High = futures pricing a big move; low = calm carry.</span>
-        </div>
-    </div>""", unsafe_allow_html=True)
-with sec9_mcols[1]:
-    # BUG-7: roll_vel_z can be None when insufficient data — render "—" instead of "0.00σ"
     if roll_vel_z is None:
         rv_zc = MUTED
         _rvz_b, _rvz_s = "—", "Collecting data"
         _rvz_display = "—"
     else:
-        rv_zc = GREEN if roll_vel_z >= THRESH.ZSCORE_BULL else (RED if roll_vel_z <= THRESH.ZSCORE_BEAR else MUTED)
-        if   roll_vel_z >= THRESH.ZSCORE_BULL: _rvz_b, _rvz_s = "BULLISH", "Above norm"
-        elif roll_vel_z <= THRESH.ZSCORE_BEAR: _rvz_b, _rvz_s = "BEARISH", "Below norm"
-        else:                                  _rvz_b, _rvz_s = "SIDEWAYS", "—"
+        rv_zc = GREEN if roll_vel_z >= get_thresh(symbol,"ZSCORE_BULL") else (RED if roll_vel_z <= get_thresh(symbol,"ZSCORE_BEAR") else MUTED)
+        if   roll_vel_z >= get_thresh(symbol,"ZSCORE_BULL"): _rvz_b, _rvz_s = "BULLISH", "Above norm"
+        elif roll_vel_z <= get_thresh(symbol,"ZSCORE_BEAR"): _rvz_b, _rvz_s = "BEARISH", "Below norm"
+        else:                                                _rvz_b, _rvz_s = "SIDEWAYS", "—"
         _rvz_display = f"{roll_vel_z:+.2f}σ"
     st.markdown(f"""
     <div style="background:{CARD};border-radius:8px;padding:10px 14px;border:1px solid {BORDER};">
@@ -2526,9 +1573,8 @@ with sec9_mcols[1]:
     </div>""", unsafe_allow_html=True)
 if roll:
     nvo = roll.get("near_vol_oi",0)
-    with sec9_mcols[2]:
+    with sec9_mcols[1]:
         nvo_c = GREEN if nvo>0.3 else (AMBER if nvo>0.1 else MUTED)
-        # v4-surgical: bias chip + plain English for Near Vol/OI
         if   nvo > 0.3:  _nvo_b, _nvo_s = "BULLISH",  "Active flow"
         elif nvo > 0.1:  _nvo_b, _nvo_s = "SIDEWAYS", "Normal"
         else:            _nvo_b, _nvo_s = "SIDEWAYS", "Quiet"
@@ -2541,9 +1587,8 @@ if roll:
                 <span style="color:{TEXT};">High = fresh bets in near month; low = stale positioning.</span>
             </div>
         </div>""", unsafe_allow_html=True)
-    with sec9_mcols[3]:
+    with sec9_mcols[2]:
         fl = roll.get("far_ltp",0)
-        # v4-surgical: bias chip + plain English for Far Month LTP
         _nl = roll.get("near_ltp", 0); _xt = roll.get("next_ltp", 0)
         if   fl > 0 and _xt > 0 and fl > _xt: _fl_b, _fl_s, _fl_c = "BULLISH",  "Steepening", GREEN
         elif fl > 0 and _xt > 0 and fl < _xt: _fl_b, _fl_s, _fl_c = "BEARISH",  "Inverting",  RED
@@ -2560,8 +1605,7 @@ if roll:
             </div>
         </div>""", unsafe_allow_html=True)
     tsb = roll.get("ts_bias",0)
-    with sec9_mcols[4]:
-        # v4-surgical: bias chip + plain English for Term Structure Bias
+    with sec9_mcols[3]:
         if   tsb >=  2: _tsb_b, _tsb_s, _tsb_c = "BULLISH", "Strong",   GREEN
         elif tsb ==  1: _tsb_b, _tsb_s, _tsb_c = "BULLISH", "Mild",     "#69F0AE"
         elif tsb <= -2: _tsb_b, _tsb_s, _tsb_c = "BEARISH", "Strong",   RED
@@ -2577,12 +1621,64 @@ if roll:
             </div>
         </div>""", unsafe_allow_html=True)
 
+# ── OWNER TOOLS: DIAGNOSTICS & CALIBRATION ────────────────────────────
+if is_owner:
+    st.markdown("---")
+    st.markdown('<div class="section-header">🔧 Owner Tools — Data Source Diagnostics & Score Calibration</div>',
+                unsafe_allow_html=True)
+
+    with st.expander("📡 Data Source Diagnostics — verify symbol resolution against Dhan's master CSV", expanded=False):
+        st.caption("Shows what get_futures_contracts() actually matched the last time the master CSV was "
+                   "parsed (cached for 24h). Use this to confirm GOLDPETAL — or any symbol — is resolving "
+                   "real contracts instead of silently falling back to demo data.")
+        if not _SYMBOL_MATCH_INFO:
+            st.info("No resolution attempt recorded yet for this session — this populates once "
+                    "get_futures_contracts() runs against the live Dhan API (requires DHAN credentials).")
+        else:
+            _diag_rows = []
+            for sym, info in _SYMBOL_MATCH_INFO.items():
+                _diag_rows.append({
+                    "Symbol": sym,
+                    "Pattern used": info.get("pattern_used", "—"),
+                    "Matched?": "✅ Yes" if info.get("matched") else "❌ No",
+                    "Contracts found": info.get("count", 0),
+                    "Sample trading symbols": ", ".join(info.get("sample", [])) or "—",
+                })
+            st.dataframe(pd.DataFrame(_diag_rows), use_container_width=True, hide_index=True)
+            if not _SYMBOL_MATCH_INFO.get(symbol, {}).get("matched", True):
+                st.error(f"⚠ {symbol} did not resolve to any MCX FUTCOM contracts — check the trading-symbol "
+                        f"prefix in SYMBOL_THRESH_OVERRIDES / _resolve_symbol_df() against Dhan's live master CSV.")
+
+    with st.expander("🔬 Score Calibration Check — does a higher score actually precede a price rise?", expanded=False):
+        st.caption("Reads the decision-log CSVs this app has been writing to disk and buckets historical "
+                   "ticks by score range, then checks the average forward move in near-month price ~15 "
+                   "ticks later. This is a sanity check using the app's OWN logged history — not a "
+                   "rigorous backtest (no slippage/costs, small early sample, single-server clock) — "
+                   "treat it as a way to catch obviously mis-calibrated weights, not as proof the score works.")
+        _log_df = load_decision_log_history(symbol)
+        if _log_df.empty:
+            st.info(f"No logged history yet for {symbol} — check back after the app has been running for a while.")
+        else:
+            _summary = score_calibration_check(_log_df)
+            if _summary is None or _summary.empty:
+                st.info(f"Only {len(_log_df)} logged ticks so far for {symbol} — need more history "
+                        f"(at least ~20 ticks) before a forward-return check is meaningful.")
+            else:
+                st.dataframe(_summary, use_container_width=True, hide_index=True)
+                st.caption(f"Based on {len(_log_df)} logged ticks for {symbol}. 'avg_fwd_return_pct' = average "
+                          f"% change in near-month price ~15 ticks later; 'pct_positive' = share of those "
+                          f"forward windows that were positive. If the scoring weights are sane, both should "
+                          f"generally trend upward from the bearish bucket to the bullish bucket — if they "
+                          f"don't (or are flat/inverted), that's a signal to revisit the weights in "
+                          f"compute_futures_score().")
+
 # ── FOOTER ────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(f"""
 <div style="text-align:center;font-size:10px;color:{MUTED};padding:10px;">
-    Shantanu's Commodity Analysis Dashboard v4.0 · Streamlit Edition<br>
-    Data: {'Dhan API (MCX)' if CFG.USE_DHAN else 'DEMO MODE'} · 
-    Auto-refresh: {AUTO_REFRESH_SECONDS}s · 
-    History ticks: {sum(len(v) for v in st.session_state['history'].values() if isinstance(v,list))}
+    Shantanu's Commodity Futures Analysis Dashboard v6.1 (Futures Only) · Streamlit Edition<br>
+    Data: {'Dhan API (MCX)' if CFG.USE_DHAN else 'DEMO MODE'} ·
+    Auto-refresh: {AUTO_REFRESH_SECONDS}s ·
+    History ticks: {sum(len(v) for v in st.session_state['history'].values() if isinstance(v,list))} ·
+    OI ticks (today): {sum(len(v) for v in st.session_state['oi_history'].values() if isinstance(v,list))}
 </div>""", unsafe_allow_html=True)
