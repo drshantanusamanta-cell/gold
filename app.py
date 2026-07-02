@@ -75,7 +75,7 @@ DATA_REFRESH_OPTIONS = {"1 min": 60, "5 min": 300, "15 min": 900, "30 min": 1800
 DEFAULT_DATA_REFRESH_LABEL = "1 min"
 
 # Fixed bucket size (minutes) for the "Score Trend — Today's Session" chart.
-SCORE_TREND_INTERVAL_MIN = 5
+SCORE_TREND_INTERVAL_MIN = 15
 
 @st.cache_resource(show_spinner=False)
 def _get_roll_cache():
@@ -958,11 +958,19 @@ def build_score_history_chart(sym_history, interval_minutes=SCORE_TREND_INTERVAL
 
     df = pd.DataFrame(rows).sort_values("dt")
     df["bucket"] = df["dt"].dt.floor(f"{interval_minutes}min")
-    resampled = df.groupby("bucket", as_index=False).last()  # last value seen in each bucket
+    # score: last value seen in the bucket. near_ltp: full OHLC within the
+    # bucket so the near-month future can be drawn as a candlestick instead
+    # of just connecting the last tick per bucket.
+    resampled = df.groupby("bucket", as_index=False).agg(
+        score=("score", "last"),
+        near_open=("near_ltp", "first"),
+        near_high=("near_ltp", "max"),
+        near_low=("near_ltp", "min"),
+        near_close=("near_ltp", "last"),
+    )
 
     ts_v = [d.strftime("%H:%M") for d in resampled["bucket"]]
     sc   = resampled["score"].tolist()
-    px   = resampled["near_ltp"].tolist()
 
     fig.add_hrect(y0=70, y1=100, fillcolor=GREEN, opacity=0.06, line_width=0)
     fig.add_hrect(y0=0,  y1=30,  fillcolor=RED,   opacity=0.06, line_width=0)
@@ -971,13 +979,16 @@ def build_score_history_chart(sym_history, interval_minutes=SCORE_TREND_INTERVAL
     fig.add_trace(go.Scatter(x=ts_v, y=sc, mode="lines+markers", name="Bias Score",
                              line=dict(color=CYAN, width=2), marker=dict(size=6),
                              hovertemplate="<b>%{x}</b><br>Score: %{y:.1f}<extra></extra>"))
-    fig.add_trace(go.Scatter(x=ts_v, y=px, mode="lines+markers", name="Near-Month Future (Spot)",
-                             line=dict(color=GOLD, width=2, dash="dot"), marker=dict(size=5),
-                             yaxis="y2",
-                             hovertemplate="<b>%{x}</b><br>Near-Month Future: ₹%{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Candlestick(x=ts_v,
+                             open=resampled["near_open"], high=resampled["near_high"],
+                             low=resampled["near_low"], close=resampled["near_close"],
+                             name="Near-Month Future (Spot)",
+                             increasing=dict(line=dict(color=GREEN), fillcolor=GREEN),
+                             decreasing=dict(line=dict(color=RED), fillcolor=RED),
+                             yaxis="y2"))
     lk = chart_layout(title=f"Futures Bias Score & Near-Month Future — Today's Session ({interval_minutes}-min intervals)")
     lk["yaxis"]  = dict(title="Score (0-100)", range=[0, 100], gridcolor="#E2E8F0")
-    lk["xaxis"]  = dict(title="Time", gridcolor="#E2E8F0")
+    lk["xaxis"]  = dict(title="Time", gridcolor="#E2E8F0", rangeslider=dict(visible=False))
     lk["yaxis2"] = dict(title="Near-Month Future (₹)", overlaying="y", side="right", showgrid=False)
     lk["legend"] = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     fig.update_layout(**lk); return fig
@@ -1471,7 +1482,7 @@ with col_metrics:
 # just plots it, so you can see whether the bias is strengthening or
 # fading intraday instead of only seeing a single point-in-time number.
 st.markdown("---")
-st.markdown('<div class="section-header">📈 Score Trend — Today\'s Session (5-min intervals, with near-month future)</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">📈 Score Trend — Today\'s Session (15-min intervals, with near-month future candlestick)</div>', unsafe_allow_html=True)
 st.plotly_chart(build_score_history_chart(st.session_state["history"].get(symbol, [])),
                 use_container_width=True, config={"displayModeBar":False})
 
