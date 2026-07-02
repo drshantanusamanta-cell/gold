@@ -286,7 +286,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 _CSV_COLUMNS = [
     "ts", "symbol", "near_ltp", "next_ltp", "far_ltp",
     "roll_spread_pct", "rollover_pct", "ts_bias",
-    "rollover_velocity", "roll_vel_z", "score",
+    "rollover_velocity", "roll_vel_z", "score", "is_demo",
 ]
 
 def _get_log_paths():
@@ -1027,18 +1027,35 @@ def load_decision_log_history(symbol, max_files=60):
         out = out.sort_values("ts").reset_index(drop=True)
     return out
 
-def score_calibration_check(log_df, forward_ticks=15):
+def _exclude_demo_ticks(df):
+    """Drops rows logged while the app was on demo/simulated data
+    (is_demo=True) before any calibration math runs on them. A demo-mode
+    price fallback isn't a real market move, so leaving it in would let a
+    single simulated jump masquerade as forward-return "edge". Older log
+    rows written before the is_demo column existed are kept as-is (there's
+    no way to retroactively tell them apart) but this is flagged in the UI."""
+    if "is_demo" not in df.columns:
+        return df, 0
+    is_demo = df["is_demo"].astype(str).str.strip().str.lower().isin(["true", "1"])
+    return df[~is_demo].copy(), int(is_demo.sum())
+
+def score_calibration_check(log_df, forward_ticks=15, min_n=20):
     """Buckets historical ticks by score range and computes the average
     forward % change in near-month price `forward_ticks` rows later
     (≈ forward_ticks minutes at a 1-tick-per-minute refresh cadence).
+    Demo-mode ticks are excluded first (see _exclude_demo_ticks). Buckets
+    with fewer than `min_n` samples are flagged low-confidence — a handful
+    of rows can be swung by a single outlier tick (e.g. a contract-rollover
+    price jump), so those should be read as informational, not evidence.
     Returns None if there isn't enough logged history yet."""
     required = {"near_ltp", "score"}
     if log_df.empty or not required.issubset(log_df.columns) or len(log_df) < forward_ticks + 5:
         return None
-    df = log_df.copy()
+    df, _ = _exclude_demo_ticks(log_df)
     df["near_ltp"] = pd.to_numeric(df["near_ltp"], errors="coerce")
     df["score"]    = pd.to_numeric(df["score"], errors="coerce")
     df = df.dropna(subset=["near_ltp", "score"])
+    if len(df) < forward_ticks + 5: return None
     df["fwd_near_ltp"]   = df["near_ltp"].shift(-forward_ticks)
     df["fwd_return_pct"] = (df["fwd_near_ltp"] - df["near_ltp"]) / df["near_ltp"] * 100
     df = df.dropna(subset=["fwd_return_pct"])
@@ -1052,7 +1069,71 @@ def score_calibration_check(log_df, forward_ticks=15):
         pct_positive=("fwd_return_pct", lambda x: round((x > 0).mean() * 100, 1)),
     ).reset_index()
     summary["avg_fwd_return_pct"] = summary["avg_fwd_return_pct"].round(4)
+    summary["confidence"] = summary["n"].apply(lambda n: "OK" if n >= min_n else f"⚠ Low (n<{min_n})")
     return summary
+
+# Raw scoring inputs — the same fields already written to the decision log
+# (see _CSV_COLUMNS) that feed compute_futures_score(). Checking each one
+# separately against forward return (instead of only the blended score)
+# shows which inputs actually carry signal, so the fixed point-weights in
+# compute_futures_score() can be reallocated toward the ones that do.
+COMPONENT_FIELDS = {
+    "roll_spread_pct":   "Roll Spread %",
+    "ts_bias":           "Term Structure Bias",
+    "rollover_velocity": "Rollover Velocity",
+    "rollover_pct":      "Rollover %",
+    "roll_vel_z":        "Roll Vel Z-Score",
+}
+
+def component_calibration_check(log_df, forward_ticks=15, min_n=20, n_buckets=3):
+    """Per-raw-input analogue of score_calibration_check(). Splits each
+    field in COMPONENT_FIELDS into `n_buckets` quantile groups (roughly
+    Low/Mid/High) and reports the same avg_fwd_return_pct / pct_positive /
+    n / confidence stats, so individual inputs can be compared against each
+    other and against the blended score. Demo-mode ticks are excluded the
+    same way as score_calibration_check().
+
+    Returns {field_name: summary_df}. A field is omitted (or has value
+    None) when there isn't enough non-demo history yet, or the field hasn't
+    varied enough this session to form distinct quantile buckets — both are
+    common early on and just mean "not enough data yet", not "no signal"."""
+    required = {"near_ltp"}
+    if log_df.empty or not required.issubset(log_df.columns) or len(log_df) < forward_ticks + 5:
+        return {}
+    base, _ = _exclude_demo_ticks(log_df)
+    base["near_ltp"] = pd.to_numeric(base["near_ltp"], errors="coerce")
+    base = base.dropna(subset=["near_ltp"])
+    if len(base) < forward_ticks + 5: return {}
+    base["fwd_near_ltp"]   = base["near_ltp"].shift(-forward_ticks)
+    base["fwd_return_pct"] = (base["fwd_near_ltp"] - base["near_ltp"]) / base["near_ltp"] * 100
+    base = base.dropna(subset=["fwd_return_pct"])
+    if base.empty: return {}
+
+    out = {}
+    for field in COMPONENT_FIELDS:
+        if field not in base.columns:
+            out[field] = None; continue
+        d = base.copy()
+        d[field] = pd.to_numeric(d[field], errors="coerce")
+        d = d.dropna(subset=[field])
+        if len(d) < forward_ticks + 5 or d[field].nunique() < n_buckets:
+            out[field] = None; continue
+        try:
+            d["bucket"] = pd.qcut(d[field], q=n_buckets, duplicates="drop")
+        except Exception:
+            out[field] = None; continue
+        if d["bucket"].nunique() < 2:
+            out[field] = None; continue
+        summary = d.groupby("bucket", observed=True).agg(
+            n=("fwd_return_pct", "size"),
+            avg_fwd_return_pct=("fwd_return_pct", "mean"),
+            pct_positive=("fwd_return_pct", lambda x: round((x > 0).mean() * 100, 1)),
+        ).reset_index()
+        summary["avg_fwd_return_pct"] = summary["avg_fwd_return_pct"].round(4)
+        summary["confidence"] = summary["n"].apply(lambda n: "OK" if n >= min_n else f"⚠ Low (n<{min_n})")
+        summary["bucket"] = summary["bucket"].astype(str)
+        out[field] = summary
+    return out
 
 # ═════════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
@@ -1301,6 +1382,7 @@ if _need_fetch:
         "roll_spread_pct": roll.get("roll_spread_pct",0), "rollover_pct": roll.get("rollover_pct",0),
         "ts_bias": roll.get("ts_bias",0), "rollover_velocity": roll.get("rollover_velocity",0),
         "roll_vel_z": roll_vel_z if roll_vel_z is not None else 0, "score": score,
+        "is_demo": _roll_is_demo,
     }
     sym_hist = st.session_state["history"].setdefault(symbol, [])
     if not sym_hist or sym_hist[-1].get("ts","")[:16] != ts_full[:16]:
@@ -1814,26 +1896,61 @@ if is_owner:
 
     with st.expander("🔬 Score Calibration Check — does a higher score actually precede a price rise?", expanded=False):
         st.caption("Reads the decision-log CSVs this app has been writing to disk and buckets historical "
-                   "ticks by score range, then checks the average forward move in near-month price ~15 "
-                   "ticks later. This is a sanity check using the app's OWN logged history — not a "
-                   "rigorous backtest (no slippage/costs, small early sample, single-server clock) — "
-                   "treat it as a way to catch obviously mis-calibrated weights, not as proof the score works.")
+                   "ticks by score range — and by each raw scoring input separately — then checks the "
+                   "average forward move in near-month price. Demo-mode ticks (is_demo=True) are excluded "
+                   "so a simulated price fallback can't be mistaken for a real move. This is a sanity check "
+                   "using the app's OWN logged history — not a rigorous backtest (no slippage/costs, small "
+                   "early sample, single-server clock) — treat it as a way to catch obviously mis-calibrated "
+                   "weights, not as proof the score works.")
+
+        _fwd_label = st.selectbox("Forward-return horizon", ["15 min", "30 min", "60 min", "120 min"],
+                                  index=0, key="calib_fwd_horizon")
+        _fwd_ticks = {"15 min": 15, "30 min": 30, "60 min": 60, "120 min": 120}[_fwd_label]
+        st.caption("Term structure / roll spread / rollover velocity are slow, structural signals — they may "
+                   "have little edge at 15 min but more over 1-2 hours. Try a longer horizon if the 15-min "
+                   "read looks flat or inverted.")
+
         _log_df = load_decision_log_history(symbol)
         if _log_df.empty:
             st.info(f"No logged history yet for {symbol} — check back after the app has been running for a while.")
         else:
-            _summary = score_calibration_check(_log_df)
+            _, _n_demo = _exclude_demo_ticks(_log_df)
+            if _n_demo:
+                st.caption(f"Excluding {_n_demo} demo-mode tick(s) out of {len(_log_df)} logged for {symbol}.")
+            if "is_demo" not in _log_df.columns:
+                st.caption("⚠ These logs include rows written before `is_demo` was tracked — those can't be "
+                           "confirmed live vs. simulated and are included as-is.")
+
+            _summary = score_calibration_check(_log_df, forward_ticks=_fwd_ticks)
             if _summary is None or _summary.empty:
                 st.info(f"Only {len(_log_df)} logged ticks so far for {symbol} — need more history "
-                        f"(at least ~20 ticks) before a forward-return check is meaningful.")
+                        f"(at least ~{_fwd_ticks + 5} non-demo ticks) before a forward-return check is meaningful.")
             else:
+                st.markdown("**By blended score**")
                 st.dataframe(_summary, use_container_width=True, hide_index=True)
                 st.caption(f"Based on {len(_log_df)} logged ticks for {symbol}. 'avg_fwd_return_pct' = average "
-                          f"% change in near-month price ~15 ticks later; 'pct_positive' = share of those "
-                          f"forward windows that were positive. If the scoring weights are sane, both should "
-                          f"generally trend upward from the bearish bucket to the bullish bucket — if they "
-                          f"don't (or are flat/inverted), that's a signal to revisit the weights in "
-                          f"compute_futures_score().")
+                          f"% change in near-month price ~{_fwd_ticks} min later; 'pct_positive' = share of "
+                          f"those forward windows that were positive; 'confidence' flags buckets with fewer "
+                          f"than 20 samples — read those as informational, not evidence. If the scoring "
+                          f"weights are sane, both return columns should generally trend upward from the "
+                          f"bearish bucket to the bullish bucket — if they don't (or are flat/inverted), "
+                          f"that's a signal to revisit the weights in compute_futures_score().")
+
+                st.markdown("**By individual raw input** — shows which inputs to `compute_futures_score()` "
+                            "actually carry forward-return signal, so you know what to reweight instead of "
+                            "guessing.")
+                _comp_summaries = component_calibration_check(_log_df, forward_ticks=_fwd_ticks)
+                _shown_any = False
+                for _field, _label in COMPONENT_FIELDS.items():
+                    _comp_df = _comp_summaries.get(_field)
+                    if _comp_df is None or _comp_df.empty:
+                        continue
+                    _shown_any = True
+                    st.caption(_label)
+                    st.dataframe(_comp_df, use_container_width=True, hide_index=True)
+                if not _shown_any:
+                    st.info("Not enough variation yet in the raw inputs to bucket them individually — "
+                            "check back after more history has been collected.")
 
 # ── FOOTER ────────────────────────────────────────────────────────────
 st.markdown("---")
