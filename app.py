@@ -64,7 +64,17 @@ class CFG:
     USE_DHAN      = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
     USE_DEMO_MODE = not USE_DHAN
 
-AUTO_REFRESH_SECONDS = 60
+AUTO_REFRESH_SECONDS = 60   # page keepalive rerun cadence — NOT the API data-refresh cadence (see below)
+
+# User-customisable API data-refresh cadence. The page itself still reruns
+# every AUTO_REFRESH_SECONDS (60s) to stay alive, but the actual Dhan API
+# call / score recompute only happens once this interval has elapsed —
+# selectable from the dropdown in the top controls.
+DATA_REFRESH_OPTIONS = {"1 min": 60, "5 min": 300, "15 min": 900, "30 min": 1800}
+DEFAULT_DATA_REFRESH_LABEL = "1 min"
+
+# Fixed bucket size (minutes) for the "Score Trend — Today's Session" chart.
+SCORE_TREND_INTERVAL_MIN = 5
 
 # ─────────────────────────────────────────────────────────────────────
 #  ASSET CLASSES — MCX commodity futures
@@ -885,35 +895,74 @@ def build_rollover_velocity_chart(oi_history, symbol):
     lk["yaxis"] = dict(title="Velocity Ratio", gridcolor="#E2E8F0", zeroline=True, zerolinecolor="#94A3B8")
     lk["xaxis"] = dict(title="Time", gridcolor="#E2E8F0"); fig.update_layout(**lk); return fig
 
-def build_score_history_chart(sym_history):
-    """Line chart of the futures bias score across today's session, built
-    from the same per-tick history already being logged for `history`.
-    Cheap to add since the score is already recorded on every tick — this
-    just plots it, giving a sense of whether the bias is strengthening or
-    fading intraday instead of only showing a single point-in-time number."""
+def _parse_hist_ts(ts):
+    """Parse a history tick's ts field, which may be a full ISO timestamp
+    with offset (current format: now_ist().isoformat()) or the older bare
+    'YYYY-MM-DD HH:MM' format — kept for backward compatibility with
+    already-saved history files."""
+    ts = str(ts)
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try: return datetime.strptime(ts, fmt)
+        except Exception: continue
+    return None
+
+def build_score_history_chart(sym_history, interval_minutes=SCORE_TREND_INTERVAL_MIN):
+    """Line chart of the futures bias score across today's session, resampled
+    to `interval_minutes` buckets (default 5-min), with the nearest-expiry
+    (near-month) futures price overlaid on a secondary axis — treated as the
+    underlying "spot" for this asset, same as `spot = roll.get("near_ltp")`
+    used elsewhere in the dashboard. Built from the same per-tick history
+    already being logged for `history`, just bucketed and given a second
+    series instead of plotting every raw tick."""
     fig = go.Figure()
+
+    def _empty(msg):
+        fig.add_annotation(text=msg, xref="paper", yref="paper", x=0.5, y=0.5,
+                           showarrow=False, font=dict(color=MUTED, size=12))
+        fig.update_layout(**chart_layout(
+            title=f"Futures Bias Score & Near-Month Future — Today's Session ({interval_minutes}-min)"))
+        return fig
+
     if len(sym_history) < 2:
-        fig.add_annotation(text="Collecting score history… refresh a few times",
-                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(color=MUTED, size=12))
-        fig.update_layout(**chart_layout(title="Futures Bias Score — Today's Session")); return fig
+        return _empty("Collecting score history… refresh a few times")
 
-    def _hm(ts):
-        ts = str(ts)
-        return ts[11:16] if len(ts) >= 16 and ts[10] == "T" else _disp_hm(ts)
+    rows = []
+    for h in sym_history:
+        dt = _parse_hist_ts(h.get("ts", ""))
+        if dt is None: continue
+        rows.append({"dt": dt, "score": safe_num(h.get("score", 50)),
+                     "near_ltp": safe_num(h.get("near_ltp", 0))})
+    if len(rows) < 2:
+        return _empty("Collecting score history… refresh a few times")
 
-    ts_v = [_hm(h.get("ts", "")) for h in sym_history]
-    sc   = [safe_num(h.get("score", 50)) for h in sym_history]
+    df = pd.DataFrame(rows).sort_values("dt")
+    df["bucket"] = df["dt"].dt.floor(f"{interval_minutes}min")
+    resampled = df.groupby("bucket", as_index=False).last()  # last value seen in each bucket
+
+    ts_v = [d.strftime("%H:%M") for d in resampled["bucket"]]
+    sc   = resampled["score"].tolist()
+    px   = resampled["near_ltp"].tolist()
 
     fig.add_hrect(y0=70, y1=100, fillcolor=GREEN, opacity=0.06, line_width=0)
     fig.add_hrect(y0=0,  y1=30,  fillcolor=RED,   opacity=0.06, line_width=0)
     fig.add_hline(y=50, line_dash="dash", line_color=MUTED, opacity=0.5,
                   annotation_text="neutral", annotation_font_size=10)
-    fig.add_trace(go.Scatter(x=ts_v, y=sc, mode="lines+markers",
-                             line=dict(color=CYAN, width=2), marker=dict(size=5),
+    fig.add_trace(go.Scatter(x=ts_v, y=sc, mode="lines+markers", name="Bias Score",
+                             line=dict(color=CYAN, width=2), marker=dict(size=6),
                              hovertemplate="<b>%{x}</b><br>Score: %{y:.1f}<extra></extra>"))
-    lk = chart_layout(title="Futures Bias Score — Today's Session")
-    lk["yaxis"] = dict(title="Score (0-100)", range=[0, 100], gridcolor="#E2E8F0")
-    lk["xaxis"] = dict(title="Time", gridcolor="#E2E8F0")
+    fig.add_trace(go.Scatter(x=ts_v, y=px, mode="lines+markers", name="Near-Month Future (Spot)",
+                             line=dict(color=GOLD, width=2, dash="dot"), marker=dict(size=5),
+                             yaxis="y2",
+                             hovertemplate="<b>%{x}</b><br>Near-Month Future: ₹%{y:,.2f}<extra></extra>"))
+    lk = chart_layout(title=f"Futures Bias Score & Near-Month Future — Today's Session ({interval_minutes}-min intervals)")
+    lk["yaxis"]  = dict(title="Score (0-100)", range=[0, 100], gridcolor="#E2E8F0")
+    lk["xaxis"]  = dict(title="Time", gridcolor="#E2E8F0")
+    lk["yaxis2"] = dict(title="Near-Month Future (₹)", overlaying="y", side="right", showgrid=False)
+    lk["legend"] = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     fig.update_layout(**lk); return fig
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1026,12 +1075,16 @@ st.markdown(f"""
 # rollover-velocity z-score baseline survives an app restart — see the
 # "OI-HISTORY PERSISTENCE" section above for why this matters in practice.
 for k, v in [("history", None), ("oi_history", None), ("last_refresh", 0),
-              ("is_owner", False), ("owner_pw_attempt", ""), ("owner_login_error", False)]:
+              ("is_owner", False), ("owner_pw_attempt", ""), ("owner_login_error", False),
+              ("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL), ("last_data_refresh_ts", 0),
+              ("roll_cache", None)]:
     if k not in st.session_state:
         if k == "history":
             st.session_state[k] = load_history_from_disk()
         elif k == "oi_history":
             st.session_state[k] = load_oi_history_from_disk()
+        elif k == "roll_cache":
+            st.session_state[k] = {}
         else:
             st.session_state[k] = v
 
@@ -1067,7 +1120,9 @@ with st.sidebar:
         if st.session_state["owner_login_error"]: st.error("Incorrect password.")
     st.divider()
     st.markdown(f"""<div style="font-size:10px;color:{MUTED};text-align:center;line-height:1.6;">
-        Data source: {'Dhan API ✅' if CFG.USE_DHAN else 'DEMO MODE'}<br>Auto-refresh: {AUTO_REFRESH_SECONDS}s
+        Data source: {'Dhan API ✅' if CFG.USE_DHAN else 'DEMO MODE'}<br>
+        Page keepalive: {AUTO_REFRESH_SECONDS}s<br>
+        Data refresh: {st.session_state.get("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL)}
     </div>""", unsafe_allow_html=True)
 
 # ── AUTO-REFRESH ──────────────────────────────────────────────────────
@@ -1086,8 +1141,22 @@ st.markdown(f"""
     </div>
 </div>""", unsafe_allow_html=True)
 
+# ── LAST DATA REFRESH TIMESTAMP (clear, prominent, top of dashboard) ───
+_last_data_ts = st.session_state.get("last_data_refresh_ts", 0)
+if _last_data_ts:
+    _last_data_dt_str = datetime.fromtimestamp(_last_data_ts, _IST).strftime("%d-%b-%Y %H:%M:%S")
+    _secs_ago = max(0, int(time.time() - _last_data_ts))
+    _ago_str = f"{_secs_ago}s ago" if _secs_ago < 60 else f"{_secs_ago//60}m {_secs_ago%60}s ago"
+else:
+    _last_data_dt_str, _ago_str = "—", "—"
+st.markdown(f"""
+<div style="text-align:center;background:{SECTION_BG};border:1px solid {BORDER};border-radius:8px;
+            padding:6px 12px;margin-bottom:12px;font-size:12px;font-weight:700;color:{ACCENT};">
+    🕐 Data last refreshed: {_last_data_dt_str} IST&nbsp; (<span style="color:{MUTED};font-weight:600;">{_ago_str}</span>)
+</div>""", unsafe_allow_html=True)
+
 # ── TOP CONTROLS ──────────────────────────────────────────────────────
-col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([2,2,2,1])
+col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4, col_ctrl5 = st.columns([2,2,2,1,1.6])
 with col_ctrl1:
     symbol = st.selectbox("ASSET CLASS", COMMODITY_SYMBOLS, index=0,
                           format_func=lambda s: SYMBOL_LABELS.get(s, s))
@@ -1097,7 +1166,7 @@ with col_ctrl2:
     </div>""", unsafe_allow_html=True)
 with col_ctrl3:
     st.markdown(f"""<div style="padding-top:28px;font-size:11px;color:{MUTED};">
-        🕐 Last updated: {strftime_ist('%H:%M:%S')} IST
+        🕐 Page rendered: {strftime_ist('%H:%M:%S')} IST
     </div>""", unsafe_allow_html=True)
 with col_ctrl4:
     if is_owner:
@@ -1106,6 +1175,10 @@ with col_ctrl4:
     else:
         refresh_clicked = False
         st.markdown(f"""<div style="padding-top:32px;font-size:10px;color:{MUTED};text-align:center;">🔒 View Only</div>""", unsafe_allow_html=True)
+with col_ctrl5:
+    st.selectbox("API DATA REFRESH", list(DATA_REFRESH_OPTIONS.keys()), key="data_refresh_freq",
+                help="How often live data is actually pulled from the API. The page itself still "
+                     "refreshes every 1 minute to stay alive — this only controls the data pull cadence.")
 
 if is_owner: auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
 else:        auto_refresh = True
@@ -1123,14 +1196,72 @@ if auto_refresh:
 if refresh_clicked:
     st.session_state["last_refresh"] = time.time(); st.rerun()
 
-# ── FETCH FUTURES DATA ────────────────────────────────────────────────
-roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
-_roll_is_demo = False
-if not roll and CFG.USE_DHAN:
-    roll = demo_futures_roll(symbol)
-    _roll_is_demo = True
-if not roll:
-    st.error("No futures data available. Check API credentials or try again."); st.stop()
+# ── FETCH FUTURES DATA (gated by user-selected data-refresh frequency) ─
+# The page itself keeps rerunning every AUTO_REFRESH_SECONDS (60s) to stay
+# alive, but we only actually hit the API / recompute the score+matrix once
+# the user's chosen data-refresh interval has elapsed. On "keepalive-only"
+# reruns in between, everything below reuses the last fetched tick from
+# st.session_state["roll_cache"] so nothing on screen flickers or changes
+# until real new data arrives.
+_freq_label   = st.session_state.get("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL)
+_freq_seconds = DATA_REFRESH_OPTIONS.get(_freq_label, 60)
+_now_ts       = time.time()
+_cache        = st.session_state["roll_cache"].get(symbol)
+_need_fetch   = (_cache is None) or ((_now_ts - _cache["fetched_at"]) >= _freq_seconds) or refresh_clicked
+
+if _need_fetch:
+    roll = fetch_futures_roll(symbol) if CFG.USE_DHAN else demo_futures_roll(symbol)
+    _roll_is_demo = False
+    if not roll and CFG.USE_DHAN:
+        roll = demo_futures_roll(symbol)
+        _roll_is_demo = True
+    if not roll and _cache:
+        roll, _roll_is_demo = _cache["roll"], _cache["is_demo"]   # keep last-good data instead of erroring
+    if not roll:
+        st.error("No futures data available. Check API credentials or try again."); st.stop()
+
+    # Record intraday OI FIRST, then compute derived roll metrics so the
+    # dashboard reflects the *current* tick's velocity and z-score.
+    st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
+    save_oi_history_to_disk(st.session_state["oi_history"])
+    roll_vel_z, roll_vel_interp, roll_vel_color = compute_rollover_velocity_zscore(st.session_state["oi_history"], symbol)
+
+    _latest_oi_ticks = st.session_state["oi_history"].get(symbol, [{}])
+    _latest_rv = _latest_oi_ticks[-1].get("rollover_velocity", None) if _latest_oi_ticks else None
+    roll["rollover_velocity"] = _latest_rv if _latest_rv is not None else get_thresh(symbol, "ROLL_VEL_NORMAL")
+
+    score = compute_futures_score(roll, roll_vel_z, symbol)
+    strat = futures_recommendation(score, roll, symbol)
+
+    ts_full = now_ist().isoformat(timespec="seconds")
+    tick = {
+        "ts": ts_full, "symbol": symbol,
+        "near_ltp": roll.get("near_ltp",0), "next_ltp": roll.get("next_ltp",0), "far_ltp": roll.get("far_ltp",0),
+        "roll_spread_pct": roll.get("roll_spread_pct",0), "rollover_pct": roll.get("rollover_pct",0),
+        "ts_bias": roll.get("ts_bias",0), "rollover_velocity": roll.get("rollover_velocity",0),
+        "roll_vel_z": roll_vel_z if roll_vel_z is not None else 0, "score": score,
+    }
+    sym_hist = st.session_state["history"].setdefault(symbol, [])
+    if not sym_hist or sym_hist[-1].get("ts","")[:16] != ts_full[:16]:
+        sym_hist.append(tick)
+        if len(sym_hist) > THRESH.HISTORY_MAX_TICKS: st.session_state["history"][symbol] = sym_hist[-THRESH.HISTORY_MAX_TICKS:]
+        save_history_to_disk(st.session_state["history"])
+    write_decision_log(dict(tick))
+
+    st.session_state["roll_cache"][symbol] = {
+        "roll": roll, "is_demo": _roll_is_demo, "fetched_at": _now_ts,
+        "score": score, "strat": strat,
+        "roll_vel_z": roll_vel_z, "roll_vel_interp": roll_vel_interp, "roll_vel_color": roll_vel_color,
+    }
+    st.session_state["last_data_refresh_ts"] = _now_ts
+else:
+    roll            = _cache["roll"]
+    _roll_is_demo   = _cache["is_demo"]
+    score           = _cache["score"]
+    strat           = _cache["strat"]
+    roll_vel_z      = _cache["roll_vel_z"]
+    roll_vel_interp = _cache["roll_vel_interp"]
+    roll_vel_color  = _cache["roll_vel_color"]
 
 spot = roll.get("near_ltp", 0)
 
@@ -1140,34 +1271,6 @@ if _roll_is_demo:
                 ⚠ DEMO DATA IN USE — the live Dhan feed returned no prices (market likely closed
                 or API issue). The score, verdict and every metric below are simulated, not real
                 market signals.</div>""", unsafe_allow_html=True)
-
-# Record intraday OI FIRST, then compute derived roll metrics so the
-# dashboard reflects the *current* tick's velocity and z-score.
-st.session_state["oi_history"] = record_intraday_oi(symbol, roll, st.session_state["oi_history"])
-save_oi_history_to_disk(st.session_state["oi_history"])
-roll_vel_z, roll_vel_interp, roll_vel_color = compute_rollover_velocity_zscore(st.session_state["oi_history"], symbol)
-
-_latest_oi_ticks = st.session_state["oi_history"].get(symbol, [{}])
-_latest_rv = _latest_oi_ticks[-1].get("rollover_velocity", None) if _latest_oi_ticks else None
-roll["rollover_velocity"] = _latest_rv if _latest_rv is not None else get_thresh(symbol, "ROLL_VEL_NORMAL")
-
-score = compute_futures_score(roll, roll_vel_z, symbol)
-strat = futures_recommendation(score, roll, symbol)
-
-ts_full = now_ist().isoformat(timespec="seconds")
-tick = {
-    "ts": ts_full, "symbol": symbol,
-    "near_ltp": roll.get("near_ltp",0), "next_ltp": roll.get("next_ltp",0), "far_ltp": roll.get("far_ltp",0),
-    "roll_spread_pct": roll.get("roll_spread_pct",0), "rollover_pct": roll.get("rollover_pct",0),
-    "ts_bias": roll.get("ts_bias",0), "rollover_velocity": roll.get("rollover_velocity",0),
-    "roll_vel_z": roll_vel_z if roll_vel_z is not None else 0, "score": score,
-}
-sym_hist = st.session_state["history"].setdefault(symbol, [])
-if not sym_hist or sym_hist[-1].get("ts","")[:16] != ts_full[:16]:
-    sym_hist.append(tick)
-    if len(sym_hist) > THRESH.HISTORY_MAX_TICKS: st.session_state["history"][symbol] = sym_hist[-THRESH.HISTORY_MAX_TICKS:]
-    save_history_to_disk(st.session_state["history"])
-write_decision_log(dict(tick))
 
 # ── HEADER CARDS ──────────────────────────────────────────────────────
 theme_color = SILVER if "SILVER" in symbol else GOLD
@@ -1319,7 +1422,7 @@ with col_metrics:
 # just plots it, so you can see whether the bias is strengthening or
 # fading intraday instead of only seeing a single point-in-time number.
 st.markdown("---")
-st.markdown('<div class="section-header">📈 Score Trend — Today\'s Session</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">📈 Score Trend — Today\'s Session (5-min intervals, with near-month future)</div>', unsafe_allow_html=True)
 st.plotly_chart(build_score_history_chart(st.session_state["history"].get(symbol, [])),
                 use_container_width=True, config={"displayModeBar":False})
 
@@ -1678,7 +1781,7 @@ st.markdown(f"""
 <div style="text-align:center;font-size:10px;color:{MUTED};padding:10px;">
     Shantanu's Commodity Futures Analysis Dashboard v6.1 (Futures Only) · Streamlit Edition<br>
     Data: {'Dhan API (MCX)' if CFG.USE_DHAN else 'DEMO MODE'} ·
-    Auto-refresh: {AUTO_REFRESH_SECONDS}s ·
+    Page keepalive: {AUTO_REFRESH_SECONDS}s · Data refresh: {st.session_state.get("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL)} ·
     History ticks: {sum(len(v) for v in st.session_state['history'].values() if isinstance(v,list))} ·
     OI ticks (today): {sum(len(v) for v in st.session_state['oi_history'].values() if isinstance(v,list))}
 </div>""", unsafe_allow_html=True)
