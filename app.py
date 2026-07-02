@@ -45,6 +45,7 @@ def strftime_ist(fmt: str):  return now_ist().strftime(fmt)
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objs as go
 
 warnings.filterwarnings("ignore")
@@ -75,6 +76,22 @@ DEFAULT_DATA_REFRESH_LABEL = "1 min"
 
 # Fixed bucket size (minutes) for the "Score Trend — Today's Session" chart.
 SCORE_TREND_INTERVAL_MIN = 5
+
+@st.cache_resource(show_spinner=False)
+def _get_roll_cache():
+    """A single mutable dict, created once and shared across EVERY rerun and
+    EVERY session for the life of the server process. st.session_state looks
+    persistent but is actually per-browser-session — it resets on a hard page
+    reload, which the AUTO-REFRESH fallback below can trigger when the
+    optional `streamlit-autorefresh` package isn't installed. Plain module-
+    level globals don't work either: Streamlit re-executes this whole script
+    top-to-bottom on every rerun, so a bare `{}` assigned at module scope
+    would be wiped every time too. st.cache_resource is the one mechanism
+    that actually survives all of that, which is what the user-selected API
+    data-refresh cadence (1/5/15/30 min) needs to keep working correctly."""
+    return {}
+
+_ROLL_CACHE = _get_roll_cache()   # {symbol: {"roll","is_demo","fetched_at","score","strat","roll_vel_z","roll_vel_interp","roll_vel_color"}}
 
 # ─────────────────────────────────────────────────────────────────────
 #  ASSET CLASSES — MCX commodity futures
@@ -1074,17 +1091,21 @@ st.markdown(f"""
 # NOTE: oi_history is loaded from disk (not just an empty dict) so the
 # rollover-velocity z-score baseline survives an app restart — see the
 # "OI-HISTORY PERSISTENCE" section above for why this matters in practice.
+try:
+    _qp_freq = st.query_params.get("freq")   # survives a hard reload (URL persists), unlike session_state
+except Exception:
+    _qp_freq = None
+
 for k, v in [("history", None), ("oi_history", None), ("last_refresh", 0),
               ("is_owner", False), ("owner_pw_attempt", ""), ("owner_login_error", False),
-              ("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL), ("last_data_refresh_ts", 0),
-              ("roll_cache", None)]:
+              ("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL)]:
     if k not in st.session_state:
         if k == "history":
             st.session_state[k] = load_history_from_disk()
         elif k == "oi_history":
             st.session_state[k] = load_oi_history_from_disk()
-        elif k == "roll_cache":
-            st.session_state[k] = {}
+        elif k == "data_refresh_freq":
+            st.session_state[k] = _qp_freq if _qp_freq in DATA_REFRESH_OPTIONS else v
         else:
             st.session_state[k] = v
 
@@ -1142,7 +1163,10 @@ st.markdown(f"""
 </div>""", unsafe_allow_html=True)
 
 # ── LAST DATA REFRESH TIMESTAMP (clear, prominent, top of dashboard) ───
-_last_data_ts = st.session_state.get("last_data_refresh_ts", 0)
+# Sourced from the cross-session _ROLL_CACHE (not st.session_state) so it
+# stays accurate even after the hard-reload AUTO-REFRESH fallback further
+# down resets session_state.
+_last_data_ts = max((v.get("fetched_at", 0) for v in _ROLL_CACHE.values()), default=0)
 if _last_data_ts:
     _last_data_dt_str = datetime.fromtimestamp(_last_data_ts, _IST).strftime("%d-%b-%Y %H:%M:%S")
     _secs_ago = max(0, int(time.time() - _last_data_ts))
@@ -1179,6 +1203,10 @@ with col_ctrl5:
     st.selectbox("API DATA REFRESH", list(DATA_REFRESH_OPTIONS.keys()), key="data_refresh_freq",
                 help="How often live data is actually pulled from the API. The page itself still "
                      "refreshes every 1 minute to stay alive — this only controls the data pull cadence.")
+    try:
+        st.query_params["freq"] = st.session_state["data_refresh_freq"]  # survive a hard reload
+    except Exception:
+        pass
 
 if is_owner: auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
 else:        auto_refresh = True
@@ -1189,10 +1217,32 @@ if auto_refresh:
         refresh_placeholder.markdown(f"<div style='text-align:center;font-size:11px;color:{MUTED};'>⏳ Auto-refresh in {remaining}s</div>", unsafe_allow_html=True)
     if time_since >= AUTO_REFRESH_SECONDS:
         st.session_state["last_refresh"] = time.time(); st.rerun()
+    # Without a periodic trigger, NOTHING below auto-reruns on its own —
+    # Streamlit only reruns on a widget interaction or an explicit
+    # st.rerun(), and the st.rerun() above only fires once we're already
+    # mid-rerun. streamlit_autorefresh supplies that trigger without losing
+    # session state; if the package isn't installed (e.g. missing from
+    # requirements.txt on Streamlit Community Cloud), it used to fail
+    # silently and the page would only ever refresh on a manual click —
+    # the fallback below guarantees a periodic trigger either way.
+    _autorefresh_active = False
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=AUTO_REFRESH_SECONDS*1000, key="autorefresh")
-    except ImportError: pass
+        _autorefresh_active = True
+    except ImportError:
+        pass
+    if not _autorefresh_active:
+        # Dependency-free fallback: a JS timer reloads the whole page every
+        # AUTO_REFRESH_SECONDS. This is a hard reload (owner login / widget
+        # selections reset — the data-refresh cadence itself is preserved via
+        # the cache_resource-backed _ROLL_CACHE + URL query param above), but
+        # it reliably keeps the dashboard live without any extra package.
+        # Add `streamlit-autorefresh` to requirements.txt for a smoother,
+        # session-preserving auto-refresh instead of this fallback.
+        components.html(
+            f"<script>setTimeout(function(){{ window.parent.location.reload(); }}, {AUTO_REFRESH_SECONDS*1000});</script>",
+            height=0, width=0)
 if refresh_clicked:
     st.session_state["last_refresh"] = time.time(); st.rerun()
 
@@ -1201,12 +1251,12 @@ if refresh_clicked:
 # alive, but we only actually hit the API / recompute the score+matrix once
 # the user's chosen data-refresh interval has elapsed. On "keepalive-only"
 # reruns in between, everything below reuses the last fetched tick from
-# st.session_state["roll_cache"] so nothing on screen flickers or changes
-# until real new data arrives.
+# _ROLL_CACHE (cache_resource — survives hard reloads too) so nothing on
+# screen flickers or changes until real new data arrives.
 _freq_label   = st.session_state.get("data_refresh_freq", DEFAULT_DATA_REFRESH_LABEL)
 _freq_seconds = DATA_REFRESH_OPTIONS.get(_freq_label, 60)
 _now_ts       = time.time()
-_cache        = st.session_state["roll_cache"].get(symbol)
+_cache        = _ROLL_CACHE.get(symbol)
 _need_fetch   = (_cache is None) or ((_now_ts - _cache["fetched_at"]) >= _freq_seconds) or refresh_clicked
 
 if _need_fetch:
@@ -1248,12 +1298,11 @@ if _need_fetch:
         save_history_to_disk(st.session_state["history"])
     write_decision_log(dict(tick))
 
-    st.session_state["roll_cache"][symbol] = {
+    _ROLL_CACHE[symbol] = {
         "roll": roll, "is_demo": _roll_is_demo, "fetched_at": _now_ts,
         "score": score, "strat": strat,
         "roll_vel_z": roll_vel_z, "roll_vel_interp": roll_vel_interp, "roll_vel_color": roll_vel_color,
     }
-    st.session_state["last_data_refresh_ts"] = _now_ts
 else:
     roll            = _cache["roll"]
     _roll_is_demo   = _cache["is_demo"]
